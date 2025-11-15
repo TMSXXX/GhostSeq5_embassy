@@ -1,25 +1,22 @@
 #![no_std]
 #![no_main]
 
+// --------------------------------------------------------------------------
+// 1. (添加) 声明我们的新模块
+// --------------------------------------------------------------------------
+mod synth;
+use micromath::F32Ext;
 use core::fmt::Write;
 use defmt::*;
 use embassy_executor::{Executor, InterruptExecutor, Spawner};
 use embassy_futures::select::{Either, select};
-use once_cell::sync::OnceCell;
 use embassy_stm32::{
-    gpio::{AnyPin, Input, Level, Output, Pull, Speed},
-    i2c::I2c,
-    i2s,
-    interrupt::{self, InterruptExt, Priority}, // 确保导入 Priority
-    time::Hertz,
-    Peri,
+    Peri, adc::{Adc, SampleTime}, exti::ExtiInput, gpio::{AnyPin, Input, Level, Output, Pin, Pull, Speed}, i2c::I2c, i2s, interrupt::{self, InterruptExt, Priority}, time::Hertz
 };
-use embassy_sync::{
-    blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex}, // 导入 CriticalSectionRawMutex
-    channel::Channel,
-};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::Timer;
 use heapless::String;
+use once_cell::sync::OnceCell;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -32,63 +29,106 @@ use embedded_graphics::{
 };
 use embedded_graphics::{mono_font::ascii::FONT_6X10, text::Baseline};
 use embedded_graphics::{pixelcolor::BinaryColor, primitives::Rectangle};
-use micromath::F32Ext;
 use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
+
+// --------------------------------------------------------------------------
+// 2. (清理) 移除所有 synth 相关的 struct 和 const
+//    (FmParams, Envelope, NOTE_FREQUENCIES)
+// --------------------------------------------------------------------------
 
 type OledDisplay = Ssd1306<
     I2CInterface<I2c<'static, embassy_stm32::mode::Blocking, embassy_stm32::i2c::Master>>,
     DisplaySize128x64,
     ssd1306::mode::BufferedGraphicsMode<DisplaySize128x64>,
 >;
-type WaveformBuffer = ([i32; 128], f32);
 type OledText = String<16>;
 
-// 使用官方示例的缓冲区大小
+// ... (DMA consts) ...
 const AUDIO_DMA_BUF_SIZE: usize = 2400;
 static DMA_BUF_CELL: StaticCell<[u16; AUDIO_DMA_BUF_SIZE]> = StaticCell::new();
 const HALF_DMA_LEN: usize = AUDIO_DMA_BUF_SIZE / 2; // 1200
 const SAMPLES_PER_BUFFER: usize = HALF_DMA_LEN / 2; // 600
+static AUDIO_BUFFERS: StaticCell<[[u16; HALF_DMA_LEN]; 2]> = StaticCell::new();
 
-const SINE_TABLE_SIZE: usize = 1024;
+const HAAS_DELAY_MS: usize = 20; // 20ms 延迟
+const HAAS_DELAY_SIZE: usize = (48000 * HAAS_DELAY_MS) / 1000; // 48000Hz * 0.020s = 960 个采样
+static HAAS_DELAY_LINE: StaticCell<[i16; HAAS_DELAY_SIZE]> = StaticCell::new();
 
-const NOTE_FREQUENCIES: [f32; 8] = [
-    // --- C4 八度 ---
-    261.63, // C4 (Do) - 按键 0
-    293.66, // D4 (Re) - 按键 1
-    329.63, // E4 (Mi) - 按键 2
-    349.23, // F4 (Fa) - 按键 3
-    392.00, // G4 (So) - 按键 4
-    440.00, // A4 (La) - 按键 5
-    493.88, // B4 (Ti) - 按键 6
-    523.25, // C5 (Do) - 按键 7
-];
+// ... (SINE_TABLE const 和 static) ...
+const WAVE_TABLE_SIZE: usize = 1024;
+static SINE_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
+static SQUARE_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
+static SAWTOOTH_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
+static TRIANGLE_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
 
-// 这是一个可以被安全地初始化一次的 static 单元
-static SINE_TABLE: OnceCell<[f32; SINE_TABLE_SIZE]> = OnceCell::new();
-
-// 我们创建一个辅助函数来获取（或在首次调用时创建）表
-fn get_sine_table() -> &'static [f32; SINE_TABLE_SIZE] {
-    // get_or_init 会在第一次被调用时运行这个闭包来创建表
-    // 并且保证这个闭包只会被运行一次。
-    // 在那之后，它只会立即返回已创建的表的引用。
+// ... (get_sine_table() 函数) ...
+fn get_sine_table() -> &'static [f32; WAVE_TABLE_SIZE] {
     SINE_TABLE.get_or_init(|| {
-        let mut table = [0.0f32; SINE_TABLE_SIZE];
-        for i in 0..SINE_TABLE_SIZE {
-            let phase = (i as f32 / SINE_TABLE_SIZE as f32) * (2.0 * PI);
-            table[i] = phase.sin(); 
+        let mut table = [0.0f32; WAVE_TABLE_SIZE];
+        for i in 0..WAVE_TABLE_SIZE {
+            let phase = (i as f32 / WAVE_TABLE_SIZE as f32) * (2.0 * PI);
+            table[i] = phase.sin();
         }
         info!("Sine table (1024 samples) generated.");
         table
     })
 }
+fn get_square_table() -> &'static [f32; WAVE_TABLE_SIZE] {
+    SQUARE_TABLE.get_or_init(|| {
+        let mut table = [0.0f32; WAVE_TABLE_SIZE];
+        for i in 0..WAVE_TABLE_SIZE {
+            // 计算当前相位（0到2π）
+            let phase = (i as f32 / WAVE_TABLE_SIZE as f32) * (2.0 * PI);
+            // 50占空比：相位在0~π时为1.0，π~2π时为-1.0
+            table[i] = if phase < PI { 1.0 } else { -1.0 };
+        }
+        info!("Square table (1024 samples) generated.");
+        table
+    })
+}
+fn get_sawtooth_table() -> &'static [f32; WAVE_TABLE_SIZE] {
+    SAWTOOTH_TABLE.get_or_init(|| {
+        let mut table = [0.0f32; WAVE_TABLE_SIZE];
+        for i in 0..WAVE_TABLE_SIZE {
+            // 计算归一化位置（0.0 ~ 1.0）
+            let normalized = i as f32 / WAVE_TABLE_SIZE as f32;
+            // 映射到[-1.0, 1.0]：0.0 → -1.0，1.0 → 1.0
+            table[i] = 2.0 * normalized - 1.0;
+        }
+        info!("Sawtooth table (1024 samples) generated.");
+        table
+    })
+}
+fn get_triangle_table() -> &'static [f32; WAVE_TABLE_SIZE] {
+    TRIANGLE_TABLE.get_or_init(|| {
+        let mut table = [0.0f32; WAVE_TABLE_SIZE];
+        // 半周期长度（前半段上升，后半段下降）
+        let half = WAVE_TABLE_SIZE / 2;
 
-// 定义消息类型
+        for i in 0..WAVE_TABLE_SIZE {
+            if i < half {
+                // 前半周期：从-1.0线性上升到1.0
+                // 归一化位置（0.0~1.0）→ 映射到[-1.0, 1.0]
+                let normalized = i as f32 / half as f32;
+                table[i] = 2.0 * normalized - 1.0;
+            } else {
+                // 后半周期：从1.0线性下降到-1.0
+                let normalized = (i - half) as f32 / half as f32;
+                table[i] = 1.0 - 2.0 * normalized;
+            }
+        }
+
+        info!("Triangle table (1024 samples) generated.");
+        table
+    })
+}
+
+// ... (Enums) ...
 #[derive(Debug, Clone, Copy)]
 enum Keyboard {
     KeyPress(u8),
     KeyRelease(u8),
 }
-
 
 #[derive(Debug, Clone, Copy)]
 enum AudioCommand {
@@ -96,36 +136,47 @@ enum AudioCommand {
     Stop,
 }
 
-// --------------------------------------------------------------------------
-// 修复 1: 将所有互斥锁更改为 CriticalSectionRawMutex
-// 这允许中断（音频）和线程模式（其他）安全通信
-// --------------------------------------------------------------------------
-static KEYBOARD_CHANNEL: Channel<CriticalSectionRawMutex, Keyboard, 8> = Channel::new();
-static FREQUENCY_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new(); // 只发送 f32
-static OLED_TEXT_CHANNEL: Channel<CriticalSectionRawMutex, OledText, 2> = Channel::new();
-static AUDIO_CHANNEL: Channel<CriticalSectionRawMutex, AudioCommand, 4> = Channel::new();
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Waveform {
+    Sine,
+    Triangle,
+    Sawtooth,
+    Square,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaveParams {
+    pub carrier_wave: Waveform,
+    pub mod_wave: Waveform,
+}
 
 // --------------------------------------------------------------------------
-// 修复 1: 按照官方示例，定义裸露的 InterruptExecutor
-// 不需要 StaticCell，也不需要泛型
+// 3. (清理) 移除 synth 相关的通道
+//    (FmParams, FM_PARAM_CHANNEL)
+//    它们现在通过 synth:: 访问
 // --------------------------------------------------------------------------
+static KEYBOARD_CHANNEL: Channel<CriticalSectionRawMutex, Keyboard, 8> = Channel::new();
+static FREQUENCY_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
+static OLED_TEXT_CHANNEL: Channel<CriticalSectionRawMutex, OledText, 2> = Channel::new();
+static AUDIO_CHANNEL: Channel<CriticalSectionRawMutex, AudioCommand, 4> = Channel::new();
+static AMP_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
+static WAVE_PARAMS_CHANNEL: Channel<CriticalSectionRawMutex, WaveParams, 2> = Channel::new();
+
+// ... (Executor 和中断定义) ...
 static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
 static EXECUTOR_MED: InterruptExecutor = InterruptExecutor::new();
 
-// --------------------------------------------------------------------------
-// 修复 2: 绑定中断函数
-// --------------------------------------------------------------------------
 #[embassy_stm32::interrupt]
 unsafe fn TIM2() {
     EXECUTOR_HIGH.on_interrupt();
 }
-
-#[embassy_stm32::interrupt] // <-- 新增
+#[embassy_stm32::interrupt]
 unsafe fn TIM3() {
     EXECUTOR_MED.on_interrupt();
 }
+
 #[embassy_executor::main]
-async fn main(spawner: Spawner) { // 这个 spawner 是 LOW 优先级的
+async fn main(spawner: Spawner) {
     enable_fpu();
     let config = {
         // ... (config 结构体完全不变) ...
@@ -165,10 +216,9 @@ async fn main(spawner: Spawner) { // 这个 spawner 是 LOW 优先级的
 
     Timer::after_millis(100).await;
 
-    
     // 初始化I2C和OLED
-   let mut i2c_config = embassy_stm32::i2c::Config::default();
-    i2c_config.frequency = Hertz(400_000); // 建议 400k 以减少阻塞
+    let mut i2c_config = embassy_stm32::i2c::Config::default();
+    i2c_config.frequency = Hertz(400_000);
 
     let i2c = I2c::new_blocking(p.I2C1, p.PB8, p.PB9, i2c_config);
     info!("I2C initialized.");
@@ -178,21 +228,31 @@ async fn main(spawner: Spawner) { // 这个 spawner 是 LOW 优先级的
         .into_buffered_graphics_mode();
     info!("OLED display created.");
 
+    // 配置键盘
     let keys: [[Peri<'static, AnyPin>; 4]; 2] = [
-        [p.PA0.into(), p.PA1.into(), p.PA2.into(), p.PA3.into()],
-        [p.PA4.into(), p.PA5.into(), p.PA6.into(), p.PA7.into()],
+        [p.PA3.into(), p.PA2.into(), p.PA1.into(), p.PA0.into()],
+        [p.PA7.into(), p.PA6.into(), p.PA5.into(), p.PA4.into()],
     ];
     info!("Keyboard pins configured.");
+
+    // 配置电位器
+    let mut adc = Adc::new(p.ADC1);
+    adc.set_sample_time(SampleTime::CYCLES15);
 
     // 使用官方示例的I2S配置
     let mut i2s_config = i2s::Config::default();
     i2s_config.format = i2s::Format::Data16Channel32;
     i2s_config.master_clock = false;
-    i2s_config.frequency = Hertz(48000); // 改为48000Hz
+    i2s_config.frequency = Hertz(48000);
 
     info!("I2S config set.");
 
-    // I2S初始化 
+    // 配置编码器
+    let enc_a = ExtiInput::new(p.PA9, p.EXTI9, Pull::Up);
+    let enc_b = ExtiInput::new(p.PA8, p.EXTI8, Pull::Up);
+    let enc_sw = ExtiInput::new(p.PA10, p.EXTI10, Pull::Up);
+
+    // I2S初始化
     let i2s = i2s::I2S::new_txonly_nomck(
         p.SPI3,     // SPI3
         p.PB5,      // sd
@@ -209,30 +269,27 @@ async fn main(spawner: Spawner) { // 这个 spawner 是 LOW 优先级的
     display.clear(BinaryColor::Off).unwrap();
     display.flush().unwrap();
 
-    // --------------------------------------------------------------------------
-    // 修复 3: 设置和启动 HIGH (P3)
-    // --------------------------------------------------------------------------
+    get_sine_table();
+    get_sawtooth_table();
+    get_square_table();
+    get_triangle_table();
+
     interrupt::TIM2.set_priority(Priority::P3);
     let spawner_high = EXECUTOR_HIGH.start(interrupt::TIM2);
-    
-    // --------------------------------------------------------------------------
-    // 修复 4: 设置和启动 MEDIUM (P7)
-    // --------------------------------------------------------------------------
-    interrupt::TIM3.set_priority(Priority::P7); // P7 高于 P15, 低于 P3
+
+    interrupt::TIM3.set_priority(Priority::P7);
     let spawner_med = EXECUTOR_MED.start(interrupt::TIM3);
-
-    // --------------------------------------------------------------------------
-    // 修复 5: 重新分配任务
-    // --------------------------------------------------------------------------
     
-    // LOW (P15): 只有 OLED 任务，它现在可以随意阻塞
+
+    // LOW (P15)
     spawner.spawn(oled_task(display)).unwrap();
+    spawner.spawn(synth::adc_task(adc, p.PB0)).unwrap();
 
-    // MEDIUM (P7): 实时输入
-    spawner_med.spawn(keyboard_task(keys)).unwrap();
-    spawner_med.spawn(synth_task()).unwrap();
+    // MEDIUM (P7):
+    spawner_med.spawn(synth::control_task(keys)).unwrap(); // <-- 调用新模块的任务
+    spawner_med.spawn(synth::encoder_task(enc_a, enc_b, enc_sw)).unwrap();
 
-    // HIGH (P3): 实时音频
+    // HIGH (P3)
     spawner_high.spawn(audio_task(i2s)).unwrap();
 
     info!("All tasks started, system ready!");
@@ -247,48 +304,14 @@ fn enable_fpu() {
     }
 }
 
-// keyboard_task 保持不变 (使用 CriticalSectionRawMutex)
-#[embassy_executor::task]
-async fn keyboard_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
-    info!("Keyboard task started!");
-    let [rows, cols] = keys.map(|line| line);
-    let mut rows = rows.map(|pin| Output::new(pin, Level::High, Speed::Low));
-    let cols = cols.map(|pin| Input::new(pin, Pull::Up));
-    let mut last_key_state: [bool; 16] = [false; 16];
+// --------------------------------------------------------------------------
+// 5. (清理) 移除 keyboard_task 和 synth_task
+//    它们现在在 synth.rs 中
+// --------------------------------------------------------------------------
+// [DELETE] #[embassy_executor::task] async fn keyboard_task(...)
+// [DELETE] #[embassy_executor::task] async fn synth_task(...)
 
-    loop {
-        let mut current_key_state: [bool; 16] = [false; 16];
-
-        for (r, row) in rows.iter_mut().enumerate() {
-            row.set_low();
-            Timer::after_micros(10).await; // 确保 await 足够短
-
-            for (c, col) in cols.iter().enumerate() {
-                if col.is_low() {
-                    let key_code = (r * 4 + c) as usize;
-                    current_key_state[key_code] = true;
-                }
-            }
-            row.set_high();
-        }
-
-        for i in 0..16 {
-            let key_code = i as u8;
-            if current_key_state[i] && !last_key_state[i] {
-                info!("Key Pressed: {}", key_code);
-                let _ = KEYBOARD_CHANNEL.try_send(Keyboard::KeyPress(key_code));
-            } else if !current_key_state[i] && last_key_state[i] {
-                info!("Key Released: {}", key_code);
-                let _ = KEYBOARD_CHANNEL.try_send(Keyboard::KeyRelease(key_code));
-            }
-        }
-
-        last_key_state = current_key_state;
-        Timer::after_millis(5).await; // 20ms 轮询间隔
-    }
-}
-
-// oled_task 保持不变 (使用 CriticalSectionRawMutex)
+// ... (oled_task 保持不变) ...
 #[embassy_executor::task]
 async fn oled_task(mut display: OledDisplay) {
     info!("OLED task started!");
@@ -307,7 +330,6 @@ async fn oled_task(mut display: OledDisplay) {
 
     // 初始显示
     display.clear(BinaryColor::Off).unwrap();
-    // 第一次 flush 必须在循环外，以显示 "Init..."
     // (修复：确保初始文本也被绘制)
     Rectangle::new(Point::new(0, 34), Size::new(128, 12)) // (y=34, h=12)
         .into_styled(clear_style)
@@ -318,7 +340,6 @@ async fn oled_task(mut display: OledDisplay) {
         .unwrap();
     display.flush().unwrap();
     text_dirty = false; // 我们已经画过了
-
 
     loop {
         // --- 1. 非阻塞地排空所有挂起的消息 ---
@@ -332,43 +353,35 @@ async fn oled_task(mut display: OledDisplay) {
         }
 
         // --- 2. 仅在需要时重绘 ---
-        
+
         if freq_dirty {
             let mut freq_text: String<16> = String::new();
             core::write!(freq_text, "Freq: {} Hz", frequency as i32).unwrap();
-            
-            // -----------------------------------------------------------------
-            // 修复: 清除矩形的 Y 坐标必须匹配文本
-            // 我们清除 y=10 处，高度 12 (10px 字体 + 2px 留白)
-            // -----------------------------------------------------------------
-            Rectangle::new(Point::new(0, 10), Size::new(128, 12)) 
+
+            Rectangle::new(Point::new(0, 10), Size::new(128, 12))
                 .into_styled(clear_style)
                 .draw(&mut display)
                 .unwrap();
-            Text::with_baseline(&freq_text, Point::new(0, 10), text_style, Baseline::Top) 
+            Text::with_baseline(&freq_text, Point::new(0, 10), text_style, Baseline::Top)
                 .draw(&mut display)
                 .unwrap();
         }
 
         if text_dirty {
-             // -----------------------------------------------------------------
-             // 修复: 清除矩形的 Y 坐标必须匹配文本
-             // 我们清除 y=34 处，高度 12 (10px 字体 + 2px 留白)
-             // -----------------------------------------------------------------
-             Rectangle::new(Point::new(0, 34), Size::new(128, 12)) 
+            Rectangle::new(Point::new(0, 34), Size::new(128, 12))
                 .into_styled(clear_style)
                 .draw(&mut display)
                 .unwrap();
-            Text::with_baseline(&key_text, Point::new(0, 34), text_style, Baseline::Top) 
+            Text::with_baseline(&key_text, Point::new(0, 34), text_style, Baseline::Top)
                 .draw(&mut display)
                 .unwrap();
         }
 
         // --- 3. 仅在有新内容时才阻塞刷新 ---
         if freq_dirty || text_dirty {
-            display.flush().unwrap(); 
+            display.flush().unwrap();
         }
-        
+
         freq_dirty = false;
         text_dirty = false;
 
@@ -377,164 +390,159 @@ async fn oled_task(mut display: OledDisplay) {
     }
 }
 
-// synth_task 保持不变 (使用 CriticalSectionRawMutex)
-#[embassy_executor::task]
-async fn synth_task() {
-    info!("Synth task started!");
-
-    let mut current_frequency = 0.0f32;
-    let mut last_frequency = 0.0f32;
-
-    // --------------------------------------------------------------------------
-    // 修复 2: 添加“切换”状态
-    // --------------------------------------------------------------------------
-    let mut is_sharp_active = false; // 我们的“切换”状态
-    const SHARP_KEY_ID: u8 = 8; // 按键 8 是我们的“切换”键
-    const SEMITONE_UP: f32 = 1.0594635; // 2^(1/12)
-
-    // 发送初始状态
-    let _ = FREQUENCY_CHANNEL.try_send(0.0); // 启动时频率为 0
-    let mut status_text: String<16> = String::new();
-    core::write!(status_text, "Ready").unwrap();
-    let _ = OLED_TEXT_CHANNEL.try_send(status_text);
-
-    loop {
-        match KEYBOARD_CHANNEL.receive().await {
-            Keyboard::KeyPress(key) => {
-                
-                if key == SHARP_KEY_ID {
-                    // --- 按下了“切换”键 (Key 8) ---
-                    is_sharp_active = !is_sharp_active; // 翻转状态
-                    info!("Sharp Toggled: {}", is_sharp_active);
-                    
-                    let mut text_to_send: String<16> = String::new();
-                    if is_sharp_active {
-                        core::write!(text_to_send, "Sharp: ON").unwrap();
-                    } else {
-                        core::write!(text_to_send, "Sharp: OFF").unwrap();
-                    }
-                    let _ = OLED_TEXT_CHANNEL.try_send(text_to_send);
-                
-                } else if key <= 7 {
-                    // --- 这是一个“音符键” (0-7) ---
-                    info!("Note Key {} pressed", key);
-                    
-                    let base_frequency = NOTE_FREQUENCIES[key as usize];
-                    
-                    current_frequency = if is_sharp_active {
-                        base_frequency * SEMITONE_UP
-                    } else {
-                        base_frequency
-                    };
-
-                    if (current_frequency - last_frequency).abs() > 1.0 {
-                        let mut text_to_send: String<16> = String::new();
-                        core::write!(text_to_send, "Note {} On", key).unwrap();
-                        let _ = OLED_TEXT_CHANNEL.try_send(text_to_send);
-                        
-                        // 发送音频命令
-                        let _ = AUDIO_CHANNEL.try_send(AudioCommand::Play(current_frequency));
-                        
-                        // ----------------------------------------------------------
-                        // 修复 3: 移除波形计算，只发送频率
-                        // ----------------------------------------------------------
-                        let _ = FREQUENCY_CHANNEL.try_send(current_frequency);
-                        last_frequency = current_frequency;
-                    }
-                    
-                    // (波形图计算已 100% 移除，P7 负担大大减轻)
-                
-                } else {
-                    // --- 这是一个“其他功能键” (9-15) ---
-                    info!("Function Key {} pressed", key);
-                    let mut text_to_send: String<16> = String::new();
-                    core::write!(text_to_send, "Func Key {}", key).unwrap();
-                    let _ = OLED_TEXT_CHANNEL.try_send(text_to_send);
-                }
-            }
-            Keyboard::KeyRelease(key) => {
-                
-                if key == SHARP_KEY_ID {
-                    // --- 松开了“切换”键 (Key 8) ---
-                    info!("Sharp key released (no action)");
-                    // “切换”逻辑下，松开按键不做任何事
-
-                } else if key <= 7 {
-                    // --- 松开了“音符键” (0-7) ---
-                    info!("Note Key {} released", key);
-
-                    let mut text_to_send: String<16> = String::new();
-                    core::write!(text_to_send, "Note {} Off", key).unwrap();
-                    let _ = OLED_TEXT_CHANNEL.try_send(text_to_send);
-                    
-                    let _ = AUDIO_CHANNEL.try_send(AudioCommand::Stop);
-                    last_frequency = 0.0;
-                    current_frequency = 0.0;
-                    
-                    // ----------------------------------------------------------
-                    // 修复 3 (续): 发送 0.0 频率到 OLED
-                    // ----------------------------------------------------------
-                    let _ = FREQUENCY_CHANNEL.try_send(0.0);
-                
-                } else {
-                    // --- 松开了“其他功能键” (9-15) ---
-                    info!("Function Key {} released", key);
-                }
-            }
-        }
-        Timer::after_millis(1).await;
-    }
-}
-
-// --------------------------------------------------------------------------
-// 修复 3: 更新 audio_task 以使用正确的缓冲区大小 (HALF_DMA_LEN)
-// --------------------------------------------------------------------------
+// ... (audio_task 保持不变) ...
 #[embassy_executor::task()]
 async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     info!("Audio task starting...");
 
+    // (P3 本地参数 不变)
     let mut frequency = 100.0f32;
-    let mut phase: f32 = 0.0; // 0.0 到 2.0*PI 弧度
     let mut is_on = false;
+    let mut carrier_phase: f32 = 0.0;
+    let mut modulator_phase: f32 = 0.0;
+    let mut params = synth::FmParams { index: 1.5, ratio: 2.0 }; 
+    let mut amplitude: f32 = 0.0; 
+    let mut wave_params = WaveParams {
+        carrier_wave: Waveform::Triangle,
+        mod_wave: Waveform::Square,
+    };
 
-    let mut audio_buffers = [[0u16; HALF_DMA_LEN], [0u16; HALF_DMA_LEN]];
+    let audio_buffers = AUDIO_BUFFERS.init([[0u16; HALF_DMA_LEN]; 2]);
     let mut current_buffer_idx = 0;
 
-    // (fill_buffer 和 get_sine_table 保持不变)
+    // (Haas 初始化 不变)
+    let haas_delay_line = HAAS_DELAY_LINE.init([0i16; HAAS_DELAY_SIZE]);
+    let mut haas_write_ptr: usize = 0;
+    let mut haas_active: bool = false; 
+
+    const TABLE_MASK: usize = WAVE_TABLE_SIZE - 1; 
+    const TABLE_SIZE_F32: f32 = WAVE_TABLE_SIZE as f32;
+    const TWO_PI: f32 = 2.0 * PI;
+    const TWO_PI_INV: f32 = 0.15915494; 
+
+    // -----------------------------------------------------------------
+    // 修复: 把“波形表”的获取（Get）移到循环 *之外*
+    // -----------------------------------------------------------------
+    let sine_table = SINE_TABLE.get().unwrap();
+    let sawtooth_table = SAWTOOTH_TABLE.get().unwrap();
+    let square_table = SQUARE_TABLE.get().unwrap();
+    let triangle_table = TRIANGLE_TABLE.get().unwrap();
+
     let mut fill_buffer =
-        |buffer: &mut [u16; HALF_DMA_LEN], freq: f32, p: &mut f32, on: bool| {
+        |buffer: &mut [u16; HALF_DMA_LEN], freq: f32, p: &synth::FmParams, 
+         wp: &WaveParams, // <-- 传入波形参数
+         amp: f32, 
+         cp: &mut f32, mp: &mut f32, on: bool,
+         hdl: &mut [i16; HAAS_DELAY_SIZE], 
+         hwp: &mut usize, 
+         haas_on: bool
+        | {
             
-            let sine_table = get_sine_table();
-            let phase_increment = (2.0 * PI * freq) / 48000.0;
+            // (我们现在是“借用”这些表，不再调用 get_..._table())
+            
+            let carrier_freq = freq;
+            let modulator_freq = carrier_freq * p.ratio; 
+            let carrier_phase_increment = (TWO_PI * carrier_freq) / 48000.0;
+            let modulator_phase_increment = (TWO_PI * modulator_freq) / 48000.0;
             
             for i in 0..SAMPLES_PER_BUFFER {
+                
+                // 1. 计算单声道 (Mono) 样本
                 let sample_f32 = if on {
-                    const TABLE_SIZE_F32: f32 = SINE_TABLE_SIZE as f32;
-                    let index_f32 = (*p / (2.0 * PI)) * TABLE_SIZE_F32;
-                    let index_trunc = index_f32.floor(); 
-                    let index_frac = index_f32 - index_trunc; 
-                    let idx0 = index_trunc as usize;
-                    let idx1 = (idx0 + 1) % SINE_TABLE_SIZE; 
-                    let val0 = sine_table[idx0];
-                    let val1 = sine_table[idx1];
-                    (val1 - val0).mul_add(index_frac, val0) 
+                    // (调制波 B)
+                    let mod_phase_rads = *mp;
+                    let mod_index_f32 = (mod_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32; 
+                    let mod_idx0 = (mod_index_f32 as i32) as usize & TABLE_MASK;
+                    
+                    let mod_val = //triangle_table[mod_idx0];
+                    match wp.mod_wave {
+                        Waveform::Sine => sine_table[mod_idx0],
+                        Waveform::Triangle => triangle_table[mod_idx0],
+                        Waveform::Sawtooth => sawtooth_table[mod_idx0],
+                        Waveform::Square => square_table[mod_idx0],
+                    };
+                    
+                    let phase_offset = mod_val * p.index; 
+                    let mut carrier_phase_rads = *cp + phase_offset;
+                    while carrier_phase_rads < 0.0 { 
+                        carrier_phase_rads += TWO_PI;
+                    }
+
+                    // (载波 A)
+                    let carrier_index_f32 = (carrier_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32;
+                    let carrier_index_trunc_int = carrier_index_f32 as i32;
+                    let carrier_index_trunc = carrier_index_trunc_int as f32;
+                    let carrier_index_frac = carrier_index_f32 - carrier_index_trunc;
+                    let carrier_idx0 = carrier_index_trunc_int as usize; 
+                    let carrier_idx0_wrapped = carrier_idx0 & TABLE_MASK;
+                    let carrier_idx1_wrapped = (carrier_idx0 + 1) & TABLE_MASK;
+                    
+                    let (val0, val1) = //(sine_table[carrier_idx0_wrapped], sine_table[carrier_idx1_wrapped]);
+                    match wp.carrier_wave {
+                        Waveform::Sine => (sine_table[carrier_idx0_wrapped], sine_table[carrier_idx1_wrapped]),
+                        Waveform::Triangle => (triangle_table[carrier_idx0_wrapped], triangle_table[carrier_idx1_wrapped]),
+                        Waveform::Sawtooth => (sawtooth_table[carrier_idx0_wrapped], sawtooth_table[carrier_idx1_wrapped]),
+                        Waveform::Square => (square_table[carrier_idx0_wrapped], square_table[carrier_idx1_wrapped]),
+                    };
+                    (val1 - val0).mul_add(carrier_index_frac, val0)
                 } else {
                     0.0
                 };
-                let sample = (sample_f32 * 0.8 * 32767.0) as i16;
-                buffer[i * 2] = sample as u16; 
-                buffer[i * 2 + 1] = sample as u16;
-                *p += phase_increment;
-                if *p > (2.0 * PI) {
-                    *p -= (2.0 * PI);
+
+                let mono_sample_i16 = (sample_f32 * amp * 32767.0) as i16;
+
+                // (Haas 效应 不变)
+                let read_ptr = *hwp;
+                let delayed_sample_i16 = hdl[read_ptr];
+                hdl[read_ptr] = mono_sample_i16;
+                *hwp += 1;
+                if *hwp >= HAAS_DELAY_SIZE { *hwp = 0; }
+                
+                if haas_on {
+                    buffer[i * 2] = mono_sample_i16 as u16; 
+                    buffer[i * 2 + 1] = delayed_sample_i16 as u16;
+                } else {
+                    buffer[i * 2] = mono_sample_i16 as u16;
+                    buffer[i * 2 + 1] = mono_sample_i16 as u16;
                 }
+
+                // (推进相位 不变)
+                *cp += carrier_phase_increment;
+                *mp += modulator_phase_increment;
+                if *cp > TWO_PI { *cp -= TWO_PI; }
+                if *mp > TWO_PI { *mp -= TWO_PI; }
             }
-            if !on { *p = 0.0; }
+            
+            if !on { *cp = 0.0; *mp = 0.0; }
         };
 
-    // 预填充两个缓冲区
-    fill_buffer(&mut audio_buffers[0], frequency, &mut phase, is_on);
-    fill_buffer(&mut audio_buffers[1], frequency, &mut phase, is_on);
+    // (预填充)
+    fill_buffer(
+        &mut audio_buffers[0],
+        frequency,
+        &params,
+        &wave_params,
+        amplitude,
+        &mut carrier_phase,
+        &mut modulator_phase,
+        is_on,
+        haas_delay_line,
+        &mut haas_write_ptr,
+        haas_active,
+    );
+    fill_buffer(
+        &mut audio_buffers[1],
+        frequency,
+        &params,
+        &wave_params,
+        amplitude,
+        &mut carrier_phase,
+        &mut modulator_phase,
+        is_on,
+        haas_delay_line,
+        &mut haas_write_ptr,
+        haas_active,
+    );
 
     i2s.start();
     info!("I2S started!");
@@ -542,63 +550,79 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     let mut write_future = i2s.write(&audio_buffers[current_buffer_idx]);
 
     loop {
-        // 1. Await 等待上一个传输 (B0) 完成
         match write_future.await {
             Ok(_) => {}
             Err(e) => {
                 error!("I2S write error: {:?}", e); 
-                // ... (错误处理部分不变) ...
-                audio_buffers[0].fill(0); audio_buffers[1].fill(0);
-                phase = 0.0; current_buffer_idx = 0; i2s.clear();
-                fill_buffer(&mut audio_buffers[0], frequency, &mut phase, is_on);
-                fill_buffer(&mut audio_buffers[1], frequency, &mut phase, is_on);
+                audio_buffers[0].fill(0); 
+                audio_buffers[1].fill(0); 
+                carrier_phase = 0.0; modulator_phase = 0.0; 
+                current_buffer_idx = 0; 
+                i2s.clear();
+                haas_delay_line.fill(0);
+                haas_write_ptr = 0; 
+                //is_on = false;
                 write_future = i2s.write(&audio_buffers[current_buffer_idx]);
                 continue; 
             }
         }
         
-        // 2. 拆分缓冲区
+        // (缓冲区拆分逻辑 不变)
         let (buf0_slice, buf1_slice) = audio_buffers.split_at_mut(1);
         let buf0 = &mut buf0_slice[0];
-        let buf1 = &mut buf1_slice[0];
-
-        // 3. 切换索引
-        current_buffer_idx = (current_buffer_idx + 1) % 2;
-        
+        let buf1 = &mut buf1_slice[0]; 
+        current_buffer_idx ^= 1;
         let (buf_to_write, buf_to_fill);
         if current_buffer_idx == 0 {
-            buf_to_write = buf0; // B0 (即将播放)
-            buf_to_fill = buf1;  // B1 (刚刚播完)
+            buf_to_write = buf0; buf_to_fill = buf1;
         } else {
-            buf_to_write = buf1; // B1 (即将播放)
-            buf_to_fill = buf0;  // B0 (刚刚播完)
+            buf_to_write = buf1; buf_to_fill = buf0;
         }
-
-        // 4. 【关键修复】在播放 *之前* 检查新命令
+        
+        // (P3 消息接收逻辑 不变)
+        if let Ok(new_params) = synth::FM_PARAM_CHANNEL.try_receive() {
+            params = new_params; 
+        }
+        if let Ok(new_amp) = AMP_CHANNEL.try_receive() {
+            amplitude = new_amp;
+        }
+        if let Ok(haas_on) = synth::HAAS_STATE_CHANNEL.try_receive() {
+            haas_active = haas_on;
+        }
+        if let Ok(new_waves) = WAVE_PARAMS_CHANNEL.try_receive() {
+            wave_params = new_waves;
+        }
         while let Ok(command) = AUDIO_CHANNEL.try_receive() {
             match command {
                 AudioCommand::Play(freq) => {
-                    info!("Audio: Play {} Hz", freq);
                     frequency = freq;
                     is_on = true;
                 }
                 AudioCommand::Stop => {
-                    info!("Audio: Stop");
                     is_on = false;
                 }
             }
         }
-
-        // 5. 【关键修复】如果刚收到 Stop，
-        //    立即将“即将播放”的缓冲区 (buf_to_write) 清零。
+        
         if !is_on {
-            buf_to_write.fill(0); // "扼杀"即将播放的缓冲区
+            buf_to_write.fill(0); 
         }
         
-        // 6. 立即开始下一个传输 (现在可以保证是静音了)
         write_future = i2s.write(buf_to_write);
-
-        // 7. 在 B1 播放时，填充 B0
-        fill_buffer(buf_to_fill, frequency, &mut phase, is_on);
+        
+        // (填充缓冲区)
+        fill_buffer(
+            buf_to_fill,
+            frequency,
+            &params, 
+            &wave_params, 
+            amplitude, 
+            &mut carrier_phase,
+            &mut modulator_phase,
+            is_on,
+            haas_delay_line, 
+            &mut haas_write_ptr, 
+            haas_active
+        );
     }
 }
