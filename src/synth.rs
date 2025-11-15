@@ -145,10 +145,6 @@ impl Envelope {
                     self.current_value = self.sustain_level;
                     self.stage = EnvelopeStage::Sustain;
 
-                    // -----------------------------------------------------------------
-                    // 修复 Bug 2: 如果 Sustain=0 (打击乐器)，
-                    // 立即进入 Idle，而不是停在 0.0
-                    // -----------------------------------------------------------------
                     if self.sustain_level == 0.0 {
                         self.stage = EnvelopeStage::Idle;
                     }
@@ -174,10 +170,6 @@ impl Envelope {
     }
 }
 
-// --------------------------------------------------------------------------
-// 5. P7 "大脑" 任务 (合并了 keyboard + synth)
-//    (修复了 "不会停止" 的 Bug)
-// --------------------------------------------------------------------------
 #[task]
 pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
     info!("Control task (P7) started!");
@@ -212,23 +204,20 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
     let mut is_shift_held = false;
     let mut semitone_shift: i8 = 0; // 我们的“+7/-5”状态
 
-    // -----------------------------------------------------------------
-    // 修复 2: 创建两个独立的包络
-    // -----------------------------------------------------------------
 
-    // 1. 音色包络 (Timbre Envelope) - 我们的 "Rhodes" 音色
+    // 音色包络
     let mut fm_envelope = Envelope::new();
-    fm_envelope.attack_ticks = 0.2; // 2ms 极短音头 → 拨弦瞬间高频泛音爆发
-    fm_envelope.decay_ticks = 15.0; // 150ms 中等衰减 → 泛音随弦振动快速减少
-    fm_envelope.sustain_level = 0.0; // 无延音 → 符合拨奏“一拨就弱”的特性
-    fm_envelope.release_ticks = 6.0; // 30ms 释放 → 松手后残留振动快速消失
+    fm_envelope.attack_ticks = 0.2; 
+    fm_envelope.decay_ticks = 15.0; 
+    fm_envelope.sustain_level = 0.0; 
+    fm_envelope.release_ticks = 6.0; 
 
-    // 2. 振幅包络（控制音量变化，与FM包络同步增强冲击感）
+    // 音量包络
     let mut amp_envelope = Envelope::new();
-    amp_envelope.attack_ticks = 0.2; // 1ms 更快音头 → 音量瞬间达到峰值，模拟拨弦力度
-    amp_envelope.decay_ticks = 40.0; // 200ms 衰减比FM稍长 → 确保音量衰减略滞后于泛音，更自然
-    amp_envelope.sustain_level = 0.0; // 无延音 → 同FM包络，彻底衰减
-    amp_envelope.release_ticks = 25.0; // 50ms 释放略长于FM → 音量最后淡出，避免“截断感”
+    amp_envelope.attack_ticks = 0.2; 
+    amp_envelope.decay_ticks = 40.0; 
+    amp_envelope.sustain_level = 0.0; 
+    amp_envelope.release_ticks = 25.0; 
 
     // (发送初始状态 不变)
     let _ = FREQUENCY_CHANNEL.try_send(0.0);
@@ -301,12 +290,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
         if let Ok(pot_val) = crate::synth::POT1_CHANNEL.try_receive() {
             // 将 0-4095 (u16) 映射到 0.0-10.0 (f32)
             max_fm_index = (pot_val as f32 / 4096.0) * 10.0;
-
-            // -----------------------------------------------------------------
-            // 修复: 把这个新值“Log”到 OLED 屏幕上！
-            // -----------------------------------------------------------------
             let mut pot_text: String<16> = String::new();
-            // (我们把 2.5 乘以 10 变成 25，这样就不用处理 f32 格式化了)
             core::write!(pot_text, "FM Index: {}", (max_fm_index * 10.0) as i32).unwrap();
             let _ = OLED_TEXT_CHANNEL.try_send(pot_text);
         }
@@ -360,7 +344,6 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                     }
 
                     MOD_WAVE_ID => {
-                        // Key 12 (新!)
                         // 循环切换 调制波 (Modulator)
                         wave_params.mod_wave = match wave_params.mod_wave {
                             Waveform::Sine => Waveform::Triangle,
@@ -415,41 +398,37 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
         }
         last_key_state = current_key_state;
 
-        // --- 3C. 运行两个包络 ---
+        // 运行包络
         let fm_env_val = fm_envelope.tick();
-        let amp_env_val = amp_envelope.tick(); // <-- 获取音量包络的值
+        let amp_env_val = amp_envelope.tick(); // 获取音量包络的值
 
         current_params.index = fm_env_val * max_fm_index;
 
         // 发送参数
         let _ = FM_PARAM_CHANNEL.try_send(current_params);
-        let _ = AMP_CHANNEL.try_send(amp_env_val); // <-- 发送音量
+        let _ = AMP_CHANNEL.try_send(amp_env_val); // 发送音量
 
         // 音量包络结束，stop
         if amp_envelope.is_idle() && note_keys_pressed == 0 {
             let _ = AUDIO_CHANNEL.try_send(AudioCommand::Stop);
         }
-
-        // --- 4. Await 5ms ---
         Timer::after_millis(5).await;
     }
 }
 
 #[task]
 pub async fn adc_task(
-    mut adc: Adc<'static, ADC1>, // <-- 使用具体类型
-    mut pin: Peri<'static, PB0>, // <-- 使用具体类型
+    mut adc: Adc<'static, ADC1>,
+    mut pin: Peri<'static, PB0>,
 ) {
     info!("ADC task (P15) started!");
     loop {
-        // 1. 读取 ADC 值 (0-4095)
+        // 读取 ADC 值 (0-4095)
         let value = adc.blocking_read(&mut pin);
 
-        // 2. 将原始值发送给 P7 大脑
-        // (修复：路径现在是本地的)
         let _ = POT1_CHANNEL.try_send(value);
 
-        // 3. 以 50Hz (20ms) 的速率轮询
+        // 以 50Hz (20ms) 的速率轮询
         Timer::after_millis(20).await;
     }
 }
@@ -466,12 +445,11 @@ pub async fn encoder_task(
     let mut sw_prev_state = sw.is_high();
 
     loop {
-        // 1. 等待 A 相下降沿 或 按键任意边沿（仅一次借用 sw）
         let clk_fall = clk_a.wait_for_falling_edge();
         let sw_any_edge = sw.wait_for_any_edge(); // 等待任意边沿，但不依赖 Edge 枚举
 
         match select(clk_fall, sw_any_edge).await {
-            // --- 旋转事件 (A 引脚下降沿触发) ---
+            // 旋转
             Either::First(_) => {
                 if dt_b.is_low() {
                     let _ = ENCODER_ROTARY_CHANNEL.try_send(1); // 顺时针
@@ -480,7 +458,7 @@ pub async fn encoder_task(
                 }
             }
 
-            // --- 按键事件（任意边沿触发，通过状态变量判断类型）---
+            // 按键
             Either::Second(_) => {
                 // 消抖：等待 20ms 确认状态稳定
                 Timer::after_millis(20).await;

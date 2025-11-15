@@ -1,9 +1,6 @@
 #![no_std]
 #![no_main]
 
-// --------------------------------------------------------------------------
-// 1. (添加) 声明我们的新模块
-// --------------------------------------------------------------------------
 mod synth;
 use micromath::F32Ext;
 use core::fmt::Write;
@@ -31,10 +28,6 @@ use embedded_graphics::{mono_font::ascii::FONT_6X10, text::Baseline};
 use embedded_graphics::{pixelcolor::BinaryColor, primitives::Rectangle};
 use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
-// --------------------------------------------------------------------------
-// 2. (清理) 移除所有 synth 相关的 struct 和 const
-//    (FmParams, Envelope, NOTE_FREQUENCIES)
-// --------------------------------------------------------------------------
 
 type OledDisplay = Ssd1306<
     I2CInterface<I2c<'static, embassy_stm32::mode::Blocking, embassy_stm32::i2c::Master>>,
@@ -43,7 +36,6 @@ type OledDisplay = Ssd1306<
 >;
 type OledText = String<16>;
 
-// ... (DMA consts) ...
 const AUDIO_DMA_BUF_SIZE: usize = 2400;
 static DMA_BUF_CELL: StaticCell<[u16; AUDIO_DMA_BUF_SIZE]> = StaticCell::new();
 const HALF_DMA_LEN: usize = AUDIO_DMA_BUF_SIZE / 2; // 1200
@@ -54,14 +46,12 @@ const HAAS_DELAY_MS: usize = 20; // 20ms 延迟
 const HAAS_DELAY_SIZE: usize = (48000 * HAAS_DELAY_MS) / 1000; // 48000Hz * 0.020s = 960 个采样
 static HAAS_DELAY_LINE: StaticCell<[i16; HAAS_DELAY_SIZE]> = StaticCell::new();
 
-// ... (SINE_TABLE const 和 static) ...
 const WAVE_TABLE_SIZE: usize = 1024;
 static SINE_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
 static SQUARE_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
 static SAWTOOTH_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
 static TRIANGLE_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
 
-// ... (get_sine_table() 函数) ...
 fn get_sine_table() -> &'static [f32; WAVE_TABLE_SIZE] {
     SINE_TABLE.get_or_init(|| {
         let mut table = [0.0f32; WAVE_TABLE_SIZE];
@@ -150,11 +140,6 @@ pub struct WaveParams {
     pub mod_wave: Waveform,
 }
 
-// --------------------------------------------------------------------------
-// 3. (清理) 移除 synth 相关的通道
-//    (FmParams, FM_PARAM_CHANNEL)
-//    它们现在通过 synth:: 访问
-// --------------------------------------------------------------------------
 static KEYBOARD_CHANNEL: Channel<CriticalSectionRawMutex, Keyboard, 8> = Channel::new();
 static FREQUENCY_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
 static OLED_TEXT_CHANNEL: Channel<CriticalSectionRawMutex, OledText, 2> = Channel::new();
@@ -162,7 +147,6 @@ static AUDIO_CHANNEL: Channel<CriticalSectionRawMutex, AudioCommand, 4> = Channe
 static AMP_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
 static WAVE_PARAMS_CHANNEL: Channel<CriticalSectionRawMutex, WaveParams, 2> = Channel::new();
 
-// ... (Executor 和中断定义) ...
 static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
 static EXECUTOR_MED: InterruptExecutor = InterruptExecutor::new();
 
@@ -179,7 +163,6 @@ unsafe fn TIM3() {
 async fn main(spawner: Spawner) {
     enable_fpu();
     let config = {
-        // ... (config 结构体完全不变) ...
         use embassy_stm32::rcc::*;
 
         let mut config = embassy_stm32::Config::default();
@@ -304,14 +287,6 @@ fn enable_fpu() {
     }
 }
 
-// --------------------------------------------------------------------------
-// 5. (清理) 移除 keyboard_task 和 synth_task
-//    它们现在在 synth.rs 中
-// --------------------------------------------------------------------------
-// [DELETE] #[embassy_executor::task] async fn keyboard_task(...)
-// [DELETE] #[embassy_executor::task] async fn synth_task(...)
-
-// ... (oled_task 保持不变) ...
 #[embassy_executor::task]
 async fn oled_task(mut display: OledDisplay) {
     info!("OLED task started!");
@@ -342,7 +317,7 @@ async fn oled_task(mut display: OledDisplay) {
     text_dirty = false; // 我们已经画过了
 
     loop {
-        // --- 1. 非阻塞地排空所有挂起的消息 ---
+        // 非阻塞，排空所有挂起消息
         if let Ok(new_frequency) = FREQUENCY_CHANNEL.try_receive() {
             frequency = new_frequency;
             freq_dirty = true;
@@ -352,7 +327,7 @@ async fn oled_task(mut display: OledDisplay) {
             text_dirty = true;
         }
 
-        // --- 2. 仅在需要时重绘 ---
+        // 重绘制
 
         if freq_dirty {
             let mut freq_text: String<16> = String::new();
@@ -377,7 +352,7 @@ async fn oled_task(mut display: OledDisplay) {
                 .unwrap();
         }
 
-        // --- 3. 仅在有新内容时才阻塞刷新 ---
+        // 刷新
         if freq_dirty || text_dirty {
             display.flush().unwrap();
         }
@@ -385,17 +360,14 @@ async fn oled_task(mut display: OledDisplay) {
         freq_dirty = false;
         text_dirty = false;
 
-        // --- 4. Await (释放 CPU) ---
         Timer::after_millis(10).await;
     }
 }
 
-// ... (audio_task 保持不变) ...
 #[embassy_executor::task()]
 async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     info!("Audio task starting...");
 
-    // (P3 本地参数 不变)
     let mut frequency = 100.0f32;
     let mut is_on = false;
     let mut carrier_phase: f32 = 0.0;
@@ -410,7 +382,6 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     let audio_buffers = AUDIO_BUFFERS.init([[0u16; HALF_DMA_LEN]; 2]);
     let mut current_buffer_idx = 0;
 
-    // (Haas 初始化 不变)
     let haas_delay_line = HAAS_DELAY_LINE.init([0i16; HAAS_DELAY_SIZE]);
     let mut haas_write_ptr: usize = 0;
     let mut haas_active: bool = false; 
@@ -420,9 +391,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     const TWO_PI: f32 = 2.0 * PI;
     const TWO_PI_INV: f32 = 0.15915494; 
 
-    // -----------------------------------------------------------------
-    // 修复: 把“波形表”的获取（Get）移到循环 *之外*
-    // -----------------------------------------------------------------
+    // 提前获取波表
     let sine_table = SINE_TABLE.get().unwrap();
     let sawtooth_table = SAWTOOTH_TABLE.get().unwrap();
     let square_table = SQUARE_TABLE.get().unwrap();
@@ -438,7 +407,6 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
          haas_on: bool
         | {
             
-            // (我们现在是“借用”这些表，不再调用 get_..._table())
             
             let carrier_freq = freq;
             let modulator_freq = carrier_freq * p.ratio; 
@@ -447,7 +415,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             
             for i in 0..SAMPLES_PER_BUFFER {
                 
-                // 1. 计算单声道 (Mono) 样本
+                // 计算单声道
                 let sample_f32 = if on {
                     // (调制波 B)
                     let mod_phase_rads = *mp;
