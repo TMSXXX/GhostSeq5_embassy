@@ -3,7 +3,7 @@
 
 mod synth;
 // (已回退) 导入 FM_PARAM_CHANNEL, FmParams
-use crate::synth::{FmParams, FM_PARAM_CHANNEL, UiState}; 
+use crate::synth::{FILTER_PARAMS_CHANNEL, FilterParams, FmParams, MOD_ENV_CHANNEL, UiState};
 use core::fmt::Write;
 use cortex_m::peripheral::SCB;
 use defmt::*;
@@ -57,6 +57,7 @@ const HAAS_DELAY_MS: usize = 20;
 const HAAS_DELAY_SIZE: usize = (48000 * HAAS_DELAY_MS) / 1000; // 960
 static HAAS_DELAY_LINE: StaticCell<[i16; HAAS_DELAY_SIZE]> = StaticCell::new();
 const WAVE_TABLE_SIZE: usize = 1024;
+const TWO_PI: f32 = 6.28;
 static SINE_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
 static SQUARE_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
 static SAWTOOTH_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
@@ -112,7 +113,6 @@ fn get_triangle_table() -> &'static [f32; WAVE_TABLE_SIZE] {
     })
 }
 
-// ... (Enums, Structs ... 已回退) ...
 #[derive(Debug, Clone, Copy)]
 enum Keyboard {
     KeyPress(u8),
@@ -135,7 +135,22 @@ pub struct WaveParams {
     pub carrier_wave: Waveform,
     pub mod_wave: Waveform,
 }
-// (FilterState 已移除)
+struct FilterState {
+    x1: f32, // input history 1
+    x2: f32, // input history 2
+    y1: f32, // output history 1
+    y2: f32, // output history 2
+}
+impl FilterState {
+    fn new() -> Self {
+        Self {
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+}
 
 static AUDIO_CHANNEL: Channel<CriticalSectionRawMutex, AudioCommand, 4> = Channel::new();
 static AMP_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
@@ -166,7 +181,8 @@ async fn main(spawner: Spawner) {
         (*scb).shpr[11].write(Priority::P6.into());
     }
     enable_fpu();
-    let config = { //
+    let config = {
+        //
         use embassy_stm32::rcc::*;
         let mut config = embassy_stm32::Config::default();
         config.rcc.hse = Some(Hse {
@@ -226,7 +242,13 @@ async fn main(spawner: Spawner) {
     let enc_b = ExtiInput::new(p.PA8, p.EXTI8, Pull::Up);
     let enc_sw = ExtiInput::new(p.PA10, p.EXTI10, Pull::Up);
     let i2s = i2s::I2S::new_txonly_nomck(
-        p.SPI3, p.PB5, p.PA15, p.PB3, p.DMA1_CH7, DMA_BUF_CELL.init([0u16; AUDIO_DMA_BUF_SIZE]), i2s_config,
+        p.SPI3,
+        p.PB5,
+        p.PA15,
+        p.PB3,
+        p.DMA1_CH7,
+        DMA_BUF_CELL.init([0u16; AUDIO_DMA_BUF_SIZE]),
+        i2s_config,
     );
     info!("I2S configured.");
     display.init().unwrap();
@@ -240,12 +262,14 @@ async fn main(spawner: Spawner) {
     let spawner_high = EXECUTOR_HIGH.start(interrupt::TIM2);
     interrupt::TIM3.set_priority(Priority::P7);
     let spawner_med = EXECUTOR_MED.start(interrupt::TIM3);
-    
+
     // (Spawners 不变, audio_task 已恢复)
     spawner.spawn(oled_task(display)).unwrap();
     spawner_med.spawn(synth::adc_task(adc, p.PB0)).unwrap();
     spawner_med.spawn(synth::control_task(keys)).unwrap();
-    spawner_med.spawn(synth::encoder_task(enc_a, enc_b, enc_sw)).unwrap();
+    spawner_med
+        .spawn(synth::encoder_task(enc_a, enc_b, enc_sw))
+        .unwrap();
     spawner_high.spawn(audio_task(i2s)).unwrap();
 
     info!("All tasks started, system ready!");
@@ -329,27 +353,28 @@ async fn oled_task(mut display: OledDisplay) {
     }
 }
 
-
 #[embassy_executor::task()]
 async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     info!("Audio task starting...");
 
-    // --- 状态变量 (已回退) ---
+    // --- 状态变量 (已更改为减法合成) ---
     let mut frequency = 100.0f32;
     let mut is_on = false;
     let mut carrier_phase: f32 = 0.0;
-    let mut modulator_phase: f32 = 0.0; // (已恢复)
+    // (modulator_phase 已移除)
     let mut amplitude: f32 = 0.0;
     let mut wave_params = WaveParams {
-        carrier_wave: Waveform::Triangle,
+        carrier_wave: Waveform::Sawtooth, // 默认为 Saw
         mod_wave: Waveform::Square,
     };
-    // (已恢复)
-    let mut params = FmParams {
-        index: 1.5,
-        ratio: 2.0,
+
+    // (新!) 滤波器状态
+    let mut filter_params = FilterParams {
+        cutoff: 0.5,
+        resonance: 0.1,
     };
-    // (Filter 已移除)
+    let mut mod_env_val: f32 = 0.0; // 滤波器包络值
+    let mut filter_state = FilterState::new();
 
     // ... (Audio Buffers, Haas, 常量, 波表获取... 不变) ...
     let audio_buffers = AUDIO_BUFFERS.init([[0u16; HALF_DMA_LEN]; 2]);
@@ -366,59 +391,63 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     let square_table = SQUARE_TABLE.get().unwrap();
     let triangle_table = TRIANGLE_TABLE.get().unwrap();
 
-
     // --- fill_buffer (已回退到 FM 版本) ---
     let mut fill_buffer = |buffer: &mut [u16; HALF_DMA_LEN],
                            freq: f32,
-                           p: &FmParams, // (已恢复)
+                           fp: &FilterParams,    // (已更改)
+                           fs: &mut FilterState, // (新!)
                            wp: &WaveParams,
-                           amp: f32,
+                           amp: f32,     // 功放包络值
+                           mod_env: f32, // 滤波器包络值
                            cp: &mut f32,
-                           mp: &mut f32, // (已恢复)
                            on: bool,
                            hdl: &mut [i16; HAAS_DELAY_SIZE],
                            hwp: &mut usize,
                            haas_on: bool| {
-        
-        // (已恢复 FM 逻辑)
-        let carrier_freq = freq;
-        let modulator_freq = carrier_freq * p.ratio;
-        let carrier_phase_increment = (TWO_PI * carrier_freq) / 48000.0;
-        let modulator_phase_increment = (TWO_PI * modulator_freq) / 48000.0;
+        // (新!) 滤波器系数计算 (每个缓冲区执行一次)
+        // (注意：这会导致包络有 "阶梯感"，但对于 STM32 来说是最高效的)
+
+        // 1. 调制截止频率 (Cutoff)
+        // (电位器 0-1.0) * (包络 0-1.0)。
+        // 我们映射电位器值到 20Hz - 20000Hz (对数)
+        // (使用 `exp_map` 辅助函数 - 见 2D)
+        let base_cutoff_hz = exp_map(fp.cutoff, 20.0, 20000.0);
+        // 包络对截止频率进行调制 (例如，增加 5 个八度)
+        let mod_cutoff_hz = (base_cutoff_hz * (1.0 + mod_env * 15.0)).clamp(20.0, 20000.0);
+
+        // 2. 计算 Biquad LPF 系数
+        // (使用 `calc_lpf_coeffs` 辅助函数 - 见 2D)
+        let (b0, b1, b2, a1, a2) = calc_lpf_coeffs(mod_cutoff_hz, fp.resonance);
+
+        let phase_increment = (TWO_PI * freq) / 48000.0;
 
         for i in 0..SAMPLES_PER_BUFFER {
             let sample_f32 = if on {
-                
-                // (调制波 B)
-                let mod_phase_rads = *mp;
-                let mod_index_f32 = (mod_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32;
-                let mod_idx0 = (mod_index_f32 as i32) as usize & TABLE_MASK;
+                // --- 1. 振荡器 (Oscillator) ---
+                let osc_phase_rads = *cp;
+                let osc_index_f32 = (osc_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32;
+                let osc_idx0 = (osc_index_f32 as i32) as usize & TABLE_MASK;
 
-                let mod_val =
-                    match wp.mod_wave {
-                        Waveform::Sine => sine_table[mod_idx0],
-                        Waveform::Triangle => triangle_table[mod_idx0],
-                        Waveform::Sawtooth => sawtooth_table[mod_idx0],
-                        Waveform::Square => square_table[mod_idx0],
-                    };
+                // (我们只使用 carrier_wave。 mod_wave 被忽略)
+                let raw_sample = match wp.carrier_wave {
+                    Waveform::Sine => sine_table[osc_idx0],
+                    Waveform::Triangle => triangle_table[osc_idx0],
+                    Waveform::Sawtooth => sawtooth_table[osc_idx0],
+                    Waveform::Square => square_table[osc_idx0],
+                };
 
-                let phase_offset = mod_val * p.index;
-                let mut carrier_phase_rads = *cp + phase_offset;
-                while carrier_phase_rads < 0.0 {
-                    carrier_phase_rads += TWO_PI;
-                }
+                // --- 2. 滤波器 (Filter) ---
+                // 应用 Biquad LPF 方程
+                let filtered_sample =
+                    (b0 * raw_sample) + (b1 * fs.x1) + (b2 * fs.x2) - (a1 * fs.y1) - (a2 * fs.y2);
 
-                // (载波 A - 无插值)
-                let carrier_index_f32 = (carrier_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32;
-                let carrier_idx0 = (carrier_index_f32 as i32) as usize & TABLE_MASK;
+                // 更新滤波器状态 (历史)
+                fs.x2 = fs.x1;
+                fs.x1 = raw_sample;
+                fs.y2 = fs.y1;
+                fs.y1 = filtered_sample.clamp(-1.0, 1.0); // (重要!) 钳位防止失控
 
-                match wp.carrier_wave {
-                    Waveform::Sine => sine_table[carrier_idx0],
-                    Waveform::Triangle => triangle_table[carrier_idx0],
-                    Waveform::Sawtooth => sawtooth_table[carrier_idx0],
-                    Waveform::Square => square_table[carrier_idx0],
-                }
-                
+                fs.y1 // 滤波器的输出
             } else {
                 0.0
             };
@@ -427,6 +456,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             let mono_sample_i16 = (sample_f32 * amp * 32767.0) as i16;
 
             // ... (Haas 和 相位推进 逻辑不变) ...
+            // (Haas ... )
             let read_ptr = *hwp;
             let delayed_sample_i16 = hdl[read_ptr];
             hdl[read_ptr] = mono_sample_i16;
@@ -442,33 +472,50 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
                 buffer[i * 2 + 1] = mono_sample_i16 as u16;
             }
 
-            *cp += carrier_phase_increment;
-            *mp += modulator_phase_increment;
+            *cp += phase_increment;
             if *cp > TWO_PI {
                 *cp -= TWO_PI;
             }
-            if *mp > TWO_PI {
-                *mp -= TWO_PI;
-            }
+            // (mp (modulator_phase) 已移除)
         }
         if !on {
             *cp = 0.0;
-            *mp = 0.0;
+            // (重置滤波器状态)
+            fs.x1 = 0.0;
+            fs.x2 = 0.0;
+            fs.y1 = 0.0;
+            fs.y2 = 0.0;
         }
     }; // (fill_buffer 闭包结束)
 
-    // --- 预填充 (已回退) ---
+    // --- 预填充 (已更改) ---
     fill_buffer(
         &mut audio_buffers[0],
-        frequency, &params, &wave_params, amplitude,
-        &mut carrier_phase, &mut modulator_phase, is_on,
-        haas_delay_line, &mut haas_write_ptr, haas_active,
+        frequency,
+        &filter_params,
+        &mut filter_state,
+        &wave_params,
+        amplitude,
+        mod_env_val,
+        &mut carrier_phase,
+        is_on,
+        haas_delay_line,
+        &mut haas_write_ptr,
+        haas_active,
     );
     fill_buffer(
         &mut audio_buffers[1],
-        frequency, &params, &wave_params, amplitude,
-        &mut carrier_phase, &mut modulator_phase, is_on,
-        haas_delay_line, &mut haas_write_ptr, haas_active,
+        frequency,
+        &filter_params,
+        &mut filter_state,
+        &wave_params,
+        amplitude,
+        mod_env_val,
+        &mut carrier_phase,
+        is_on,
+        haas_delay_line,
+        &mut haas_write_ptr,
+        haas_active,
     );
 
     // ... (i2s.start(), write_future 不变) ...
@@ -485,7 +532,6 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
                 audio_buffers[0].fill(0);
                 audio_buffers[1].fill(0);
                 carrier_phase = 0.0;
-                modulator_phase = 0.0; // (已恢复)
                 current_buffer_idx = 0;
                 i2s.clear();
                 haas_delay_line.fill(0);
@@ -512,17 +558,18 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         write_future = i2s.write(buf_to_write);
         // --- S 关键路径结束 ---
 
-
         // --- 非关键路径 (已回退) ---
         // (移除了 MOD_ENV 和 FILTER_PARAMS)
-        if let Ok(new_params) = FM_PARAM_CHANNEL.try_receive() { // (已恢复)
-            params = new_params;
+        if let Ok(new_params) = FILTER_PARAMS_CHANNEL.try_receive() {
+            // (已更改)
+            filter_params = new_params;
+        }
+        if let Ok(new_mod_env) = MOD_ENV_CHANNEL.try_receive() {
+            // (新!)
+            mod_env_val = new_mod_env;
         }
         if let Ok(new_amp) = AMP_CHANNEL.try_receive() {
             amplitude = new_amp;
-        }
-        if let Ok(haas_on) = synth::HAAS_STATE_CHANNEL.try_receive() {
-            haas_active = haas_on;
         }
         if let Ok(new_waves) = WAVE_PARAMS_CHANNEL.try_receive() {
             wave_params = new_waves;
@@ -543,11 +590,12 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         fill_buffer(
             buf_to_fill,
             frequency,
-            &params,
+            &filter_params,
+            &mut filter_state,
             &wave_params,
             amplitude,
+            mod_env_val,
             &mut carrier_phase,
-            &mut modulator_phase,
             is_on,
             haas_delay_line,
             &mut haas_write_ptr,
@@ -556,7 +604,6 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     }
 }
 
-
 const fn wave_to_short_str(wave: Waveform) -> &'static str {
     match wave {
         Waveform::Sine => "SINE",
@@ -564,4 +611,31 @@ const fn wave_to_short_str(wave: Waveform) -> &'static str {
         Waveform::Sawtooth => "SAW",
         Waveform::Square => "SQU",
     }
+}
+
+fn calc_lpf_coeffs(cutoff_hz: f32, resonance: f32) -> (f32, f32, f32, f32, f32) {
+    const SAMPLE_RATE: f32 = 48000.0;
+    
+    // 将 0.0-1.0 的谐振映射到 0.1-20.0 的 Q 值
+    let q = 0.1 + (resonance * 19.9);
+    
+    let w0 = (TWO_PI * cutoff_hz) / SAMPLE_RATE;
+    let cos_w0 = w0.cos();
+    let alpha = w0.sin() / (2.0 * q);
+
+    let b0 = (1.0 - cos_w0) / 2.0;
+    let b1 = 1.0 - cos_w0;
+    let b2 = (1.0 - cos_w0) / 2.0;
+    let a0 = 1.0 + alpha;
+    let a1 = -2.0 * cos_w0;
+    let a2 = 1.0 - alpha;
+
+    // 归一化 (除以 a0)
+    (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+}
+
+// (新!) 对数映射
+// 将 0.0-1.0 的线性值 映射到 min-max 的对数（指数）曲线
+fn exp_map(val: f32, min: f32, max: f32) -> f32 {
+    min * (max / min).powf(val)
 }

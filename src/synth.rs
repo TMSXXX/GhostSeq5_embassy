@@ -36,6 +36,13 @@ pub struct FmParams {
     pub ratio: f32, // “音色” (0.5 - 5.0)
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FilterParams {
+    pub cutoff: f32,    // 基础截止频率 (0.0 - 1.0)
+    pub resonance: f32, // 谐振 (0.0 - 1.0)
+}
+
 const NOTE_FREQUENCIES: [f32; 8] = [
     261.63, 293.66, 329.63, 349.23, 392.00, 440.00, 493.88, 523.25,
 ];
@@ -49,7 +56,8 @@ pub type OledText = String<16>;
 
 // --- (已回退) Channel 定义 ---
 // (移除了 MOD_ENV_CHANNEL 和 FILTER_PARAMS_CHANNEL)
-pub static FM_PARAM_CHANNEL: Channel<CriticalSectionRawMutex, FmParams, 2> = Channel::new(); // (已恢复)
+pub static FILTER_PARAMS_CHANNEL: Channel<CriticalSectionRawMutex, FilterParams, 2> = Channel::new(); // (替代 FM_PARAM_CHANNEL)
+pub static MOD_ENV_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new(); // (新!) 滤波器包络通道
 pub static ENCODER_ROTARY_CHANNEL: Channel<CriticalSectionRawMutex, i8, 4> = Channel::new();
 pub static ENCODER_SWITCH_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
 pub static POT1_CHANNEL: Channel<CriticalSectionRawMutex, u16, 4> = Channel::new();
@@ -206,18 +214,18 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
     let mut note_keys_pressed: u8 = 0;
     
     // --- 3. 音色状态 (已回退) ---
-    let mut current_params = FmParams { index: 0.0, ratio: 2.0 }; // (已恢复)
-    let mut max_fm_index: f32 = 2.0; // (已恢复)
-    let mut wave_params = WaveParams { carrier_wave: Waveform::Triangle, mod_wave: Waveform::Square };
+    let mut filter_params = FilterParams { cutoff: 0.5, resonance: 0.1 };
+    let mut wave_params = WaveParams { carrier_wave: Waveform::Sawtooth, mod_wave: Waveform::Square }; // 默认用 Saw
     let mut is_haas_active = false;
     let mut is_shift_held = false;
 
     // --- 4. 包络 (已回退) ---
-    let mut fm_envelope = Envelope::new(); // (已恢复)
-    fm_envelope.attack_ticks = 0.2;
-    fm_envelope.decay_ticks = 15.0;
-    fm_envelope.sustain_level = 0.0;
-    fm_envelope.release_ticks = 6.0;
+    let mut filter_envelope = Envelope::new(); // (重命名 fm_envelope)
+    // (设置一个快速的 "Acid" pluck 音色)
+    filter_envelope.attack_ticks = 0.1;
+    filter_envelope.decay_ticks = 15.0; // "Wow" 效果的衰减时间
+    filter_envelope.sustain_level = 0.0;
+    filter_envelope.release_ticks = 1.0;
     let mut amp_envelope = Envelope::new();
     // (回到 Pluck 音色)
     amp_envelope.attack_ticks = 0.2;
@@ -241,7 +249,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
     const RECORD_ID: u8 = 14;
     
     // (发送初始状态 ... 已回退)
-    let _ = FM_PARAM_CHANNEL.try_send(current_params); // (已恢复)
+    let _ = FILTER_PARAMS_CHANNEL.try_send(filter_params); // (已更改)
     let _ = AMP_CHANNEL.try_send(0.0);
     let _ = WAVE_PARAMS_CHANNEL.try_send(wave_params);
     let _ = HAAS_STATE_CHANNEL.try_send(is_haas_active);
@@ -267,8 +275,8 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
             is_shift_held = pressed;
         }
         if let Ok(val) = crate::synth::POT1_CHANNEL.try_receive() {
-            // (已恢复) 电位器控制 FM Index
-            max_fm_index = (val as f32 / 4095.0) * 10.0;
+            // (新!) 电位器控制滤波器截止频率 (Cutoff)
+            filter_params.cutoff = val as f32 / 4095.0; // 范围 0.0 - 1.0
         }
 
         // --- 8B. 扫描键盘 (不变) ---
@@ -305,7 +313,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                             base_frequency, is_sharp_active, semitone_shift, octave_scale
                         );
                         if note_keys_pressed == 1 {
-                            fm_envelope.note_on(); // (已恢复)
+                            filter_envelope.note_on();
                             amp_envelope.note_on();
                         }
                         let _ = AUDIO_CHANNEL.try_send(AudioCommand::Play(current_frequency));
@@ -354,7 +362,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                             current_step = 0;
                             let _ = AUDIO_CHANNEL.try_send(AudioCommand::Stop);
                             amp_envelope.note_off();
-                            fm_envelope.note_off(); // (已恢复)
+                            filter_envelope.note_off(); // (已更改)
                         } else {
                             if sequencer_mode == SequencerMode::Record {
                                 sequencer_mode = SequencerMode::Play;
@@ -371,7 +379,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                     
                     if note_keys_pressed == 0 {
                         amp_envelope.note_off();
-                        fm_envelope.note_off(); // (已恢复)
+                        filter_envelope.note_off(); // (已恢复)
                     }
                 }
             }
@@ -391,23 +399,24 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                     base_frequency, note.is_sharp, note.semitone, note.octave
                 );
                 
-                fm_envelope.note_on(); // (已恢复)
+                filter_envelope.note_on();
                 amp_envelope.note_on();
                 let _ = AUDIO_CHANNEL.try_send(AudioCommand::Play(final_freq));
             
             } else if note_keys_pressed == 0 {
                 amp_envelope.note_off();
-                fm_envelope.note_off(); // (已恢复)
+                filter_envelope.note_off(); // (已更改)
             }
         }
 
         // --- 8E. 运行包络 & 发送参数 (已回退) ---
-        let fm_env_val = fm_envelope.tick(); // (已恢复)
+        let filter_env_val = filter_envelope.tick(); // (已更改)
         let amp_env_val = amp_envelope.tick();
         
-        current_params.index = fm_env_val * max_fm_index; // (已恢复)
+        // (移除 FM 逻辑)
         
-        let _ = FM_PARAM_CHANNEL.try_send(current_params); // (已恢复)
+        let _ = FILTER_PARAMS_CHANNEL.try_send(filter_params); // (已更改)
+        let _ = MOD_ENV_CHANNEL.try_send(filter_env_val); // (新!)
         let _ = AMP_CHANNEL.try_send(amp_env_val);
 
         // --- 8F. 停止播放逻辑 (不变) ---
@@ -419,7 +428,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
         let ui_state = UiState {
             octave: octave_scale,
             semitone: semitone_shift,
-            fm_index: max_fm_index, // (已恢复: 显示最大值)
+            fm_index: filter_params.cutoff,
             carrier_wave: wave_params.carrier_wave,
             mod_wave: wave_params.mod_wave,
             is_shift_held: is_shift_held,
