@@ -27,6 +27,8 @@ pub struct FmParams {
     pub ratio: f32, // “音色” (0.5 - 5.0)
 }
 
+
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DrumSample {
     Kick,
@@ -83,6 +85,14 @@ struct NoteData {
     semitone: i8,
     is_sharp: bool,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StepData {
+    note: Option<NoteData>,
+    drum: Option<DrumSample>,
+}
+
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EnvelopeStage {
     Idle,
@@ -192,7 +202,7 @@ fn calculate_final_frequency(
 }
 
 #[task]
-pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
+pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output<'static>) {
     info!("Control task (P7) started!");
 
     // --- 1. 键盘状态 (不变) ---
@@ -240,7 +250,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
     let mut bpm: f32 = 120.0;
     let mut step_duration = Duration::from_millis(125);
     let mut last_tick_time = Instant::now();
-    let mut sequence: [Option<NoteData>; 32] = [None; 32];
+    let mut sequence: [Option<StepData>; 32] = [None; 32];
 
     // --- 7. 功能键 ID (不变) ---
     const CARRIER_WAVE_ID: u8 = 11;
@@ -320,7 +330,11 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                             is_sharp: is_sharp_active,
                         };
                         if sequencer_mode == SequencerMode::Record {
-                            sequence[current_step] = Some(note_data);
+                            let step = sequence[current_step].get_or_insert(StepData {
+                                note: None,
+                                drum: None,
+                            });
+                            step.note = Some(note_data);
                         }
                         let base_frequency = NOTE_FREQUENCIES[key_code as usize];
                         current_frequency = calculate_final_frequency(
@@ -347,7 +361,28 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                         let _ = WAVE_PARAMS_CHANNEL.try_send(wave_params);
                     }
                     KICK_DRUM_ID => {
+                        if sequencer_mode == SequencerMode::Record {
+                            // (新!) 获取或创建这一步
+                            let step = sequence[current_step].get_or_insert(StepData {
+                                note: None,
+                                drum: None,
+                            });
+                            // 在这一步上设置鼓
+                            step.drum = Some(DrumSample::Kick);
+                        } 
                         let _ = DRUM_CHANNEL.try_send(DrumSample::Kick);
+                    }
+                    13 => {
+                        if sequencer_mode == SequencerMode::Record {
+                            // (新!) 获取或创建这一步
+                            let step = sequence[current_step].get_or_insert(StepData {
+                                note: None,
+                                drum: None,
+                            });
+                            // 在这一步上设置鼓
+                            step.drum = Some(DrumSample::Snare);
+                        } 
+                        let _ = DRUM_CHANNEL.try_send(DrumSample::Snare);
                     }
                     MOD_WAVE_ID => {
                         wave_params.mod_wave = match wave_params.mod_wave {
@@ -371,6 +406,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                             }
                             _ => {
                                 let _ = AUDIO_CHANNEL.try_send(AudioCommand::Stop);
+                                led.set_high();
                                 SequencerMode::Stop
                             }
                         };
@@ -379,6 +415,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                         if is_shift_held {
                             sequence = [None; 32];
                             sequencer_mode = SequencerMode::Stop;
+                            led.set_high();
                             current_step = 0;
                             let _ = AUDIO_CHANNEL.try_send(AudioCommand::Stop);
                             amp_envelope.note_off();
@@ -414,25 +451,44 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
             && (now.duration_since(last_tick_time) >= step_duration)
         {
             last_tick_time = now;
-            current_step = (current_step + 1) % 32;
+            current_step = (current_step + 1) & 31;
+            if current_step & 3 == 0 {
+                led.toggle();
+            }
 
-            if let Some(note) = sequence[current_step] {
-                let base_frequency = NOTE_FREQUENCIES[note.key_code as usize];
-                let final_freq = calculate_final_frequency(
-                    base_frequency,
-                    note.is_sharp,
-                    note.semitone,
-                    note.octave,
-                );
+            if let Some(step_data) = sequence[current_step] {
+                
+                // 2. 检查是否有音符
+                if let Some(note) = step_data.note {
+                    let base_frequency = NOTE_FREQUENCIES[note.key_code as usize]; //
+                    let final_freq = calculate_final_frequency(
+                        base_frequency, note.is_sharp, note.semitone, note.octave
+                    );
+                    
+                    fm_envelope.note_on(); //
+                    amp_envelope.note_on(); //
+                    let _ = AUDIO_CHANNEL.try_send(AudioCommand::Play(final_freq)); //
+                
+                } else if note_keys_pressed == 0 {
+                    // (这一步有鼓，但没有音符)
+                    amp_envelope.note_off(); //
+                    fm_envelope.note_off(); //
+                }
 
-                fm_envelope.note_on(); // (已恢复)
-                amp_envelope.note_on();
-                let _ = AUDIO_CHANNEL.try_send(AudioCommand::Play(final_freq));
+                // 3. (新!) 检查是否有鼓
+                if let Some(drum_sample) = step_data.drum {
+                    let _ = DRUM_CHANNEL.try_send(drum_sample);
+                }
+
             } else if note_keys_pressed == 0 {
-                amp_envelope.note_off();
-                fm_envelope.note_off(); // (已恢复)
+                // (这一步是 None，完全是空的)
+                amp_envelope.note_off(); //
+                fm_envelope.note_off(); //
             }
         }
+
+
+
 
         // --- 8E. 运行包络 & 发送参数 (已回退) ---
         let fm_env_val = fm_envelope.tick(); // (已恢复)

@@ -65,6 +65,10 @@ static TRIANGLE_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
 
 const KICK_SAMPLE_LEN: usize = 2048;
 static KICK_SAMPLE_TABLE: OnceCell<[f32; KICK_SAMPLE_LEN]> = OnceCell::new();
+const SNARE_SAMPLE_LEN: usize = 1500;
+static SNARE_SAMPLE_TABLE: OnceCell<[f32; SNARE_SAMPLE_LEN]> = OnceCell::new();
+const HAT_SAMPLE_LEN: usize = 1000;
+static HAT_SAMPLE_TABLE: OnceCell<[f32; HAT_SAMPLE_LEN]> = OnceCell::new();
 
 fn get_sine_table() -> &'static [f32; WAVE_TABLE_SIZE] {
     SINE_TABLE.get_or_init(|| {
@@ -144,6 +148,70 @@ fn get_kick_sample_table() -> &'static [f32; KICK_SAMPLE_LEN] {
             table[i] = distorted_sample * amp_env;
         }
         info!("Kick sample table (2048 samples) generated.");
+        table
+    })
+}
+fn get_snare_sample_table() -> &'static [f32; SNARE_SAMPLE_LEN] {
+    SNARE_SAMPLE_TABLE.get_or_init(|| {
+        let mut table = [0.0f32; SNARE_SAMPLE_LEN];
+        let mut tone_freq = 250.0; // 军鼓基础音高（高于底鼓）
+        let mut phase = 0.0;
+        let mut noise_seed = 42u32; // 用于生成伪随机噪音的种子
+
+        for i in 0..SNARE_SAMPLE_LEN {
+            // 1. 低频音调成分（正弦波，快速降调）
+            let tone = phase.sin();
+            tone_freq *= 0.997; // 音高衰减速度快于底鼓
+            let phase_inc = (2.0 * PI * tone_freq) / 48000.0;
+            phase += phase_inc;
+            if phase > 2.0 * PI {
+                phase -= 2.0 * PI;
+            }
+
+            // 2. 噪音成分（白噪音，提供"沙沙声"）
+            // 用线性同余发生器生成伪随机数（嵌入式环境无标准随机库）
+            noise_seed = noise_seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let noise = ((noise_seed as f32 / u32::MAX as f32) * 2.0) - 1.0; // 映射到[-1,1]
+
+            // 3. 噪音与音调混合（随时间变化比例）
+            let noise_ratio = 0.7 + (i as f32 / SNARE_SAMPLE_LEN as f32) * 0.3; // 后期噪音占比提高
+            let mixed = (tone * (1.0 - noise_ratio)) + (noise * noise_ratio);
+
+            // 4. 失真处理（增强金属感）
+            let drive = 2.5;
+            let distorted = cheap_saturator(mixed * drive);
+
+            // 5. 音量包络（前10%快速上升，后90%快速衰减）
+            let env_attack = (i as f32 / (SNARE_SAMPLE_LEN as f32 * 0.1)).min(1.0);
+            let env_decay = 1.0 - (i as f32 / SNARE_SAMPLE_LEN as f32);
+            let amp_env = env_attack * env_decay;
+
+            table[i] = distorted * amp_env * 0.8; // 降低整体增益避免削波
+        }
+        info!("Snare sample table (1500 samples) generated.");
+        table
+    })
+}
+fn get_hat_sample_table() -> &'static [f32; HAT_SAMPLE_LEN] {
+    HAT_SAMPLE_TABLE.get_or_init(|| {
+        let mut table = [0.0f32; HAT_SAMPLE_LEN];
+        let mut noise_seed = 123u32;
+        
+        for i in 0..HAT_SAMPLE_LEN {
+            // 高频噪音生成
+            noise_seed = noise_seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let noise = ((noise_seed as f32 / u32::MAX as f32) * 2.0) - 1.0;
+            
+            // 快速衰减包络
+            let env = if i < HAT_SAMPLE_LEN / 20 {
+                (i as f32 * 20.0) / HAT_SAMPLE_LEN as f32
+            } else {
+                (1.0 - (i as f32 / HAT_SAMPLE_LEN as f32)).powf(2.0)
+            };
+            
+            table[i] = noise * env * 0.5;
+        }
+        info!("Hat sample table generated.");
         table
     })
 }
@@ -259,6 +327,10 @@ async fn main(spawner: Spawner) {
     i2s_config.master_clock = false;
     i2s_config.frequency = Hertz(48000);
     info!("I2S config set.");
+
+    // led配置
+    let mut led = Output::new(p.PC13, Level::High, Speed::Low);
+    
     let enc_a = ExtiInput::new(p.PA9, p.EXTI9, Pull::Up);
     let enc_b = ExtiInput::new(p.PA8, p.EXTI8, Pull::Up);
     let enc_sw = ExtiInput::new(p.PA10, p.EXTI10, Pull::Up);
@@ -282,13 +354,13 @@ async fn main(spawner: Spawner) {
     get_kick_sample_table();
     interrupt::TIM2.set_priority(Priority::P3);
     let spawner_high = EXECUTOR_HIGH.start(interrupt::TIM2);
-    interrupt::TIM3.set_priority(Priority::P7);
+    interrupt::TIM3.set_priority(Priority::P5);
     let spawner_med = EXECUTOR_MED.start(interrupt::TIM3);
 
     // (Spawners 不变, audio_task 已恢复)
     spawner.spawn(oled_task(display)).unwrap();
     spawner_med.spawn(synth::adc_task(adc, p.PB0)).unwrap();
-    spawner_med.spawn(synth::control_task(keys)).unwrap();
+    spawner_med.spawn(synth::control_task(keys, led)).unwrap();
     spawner_med
         .spawn(synth::encoder_task(enc_a, enc_b, enc_sw))
         .unwrap();
@@ -370,7 +442,14 @@ async fn oled_task(mut display: OledDisplay) {
         Text::with_baseline(&wave_text, Point::new(0, 30), text_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
-        display.flush().unwrap();
+        match display.flush() {
+            Ok(_) => {},
+            Err(e) => {
+                // 如果 I2C 写入失败，打印错误并继续下一个循环
+                error!("OLED I2C flush error during transition");
+            }
+        }
+        
         ticker.next().await;
     }
 }
@@ -389,6 +468,8 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         carrier_wave: Waveform::Triangle,
         mod_wave: Waveform::Square,
     };
+    let mut current_drum: Option<DrumSample> = None; // 用Option<DrumSample>表示当前播放的鼓
+    let mut drum_pos: usize = 0; // 通用采样位置指针
     // (已恢复)
     let mut params = FmParams {
         index: 1.5,
@@ -411,8 +492,9 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     let square_table = SQUARE_TABLE.get().unwrap();
     let triangle_table = TRIANGLE_TABLE.get().unwrap();
 
-    let kick_sample_table = KICK_SAMPLE_TABLE.get().unwrap();
-    let mut drum_sample_ptr: usize = KICK_SAMPLE_LEN;
+    let kick_samples = get_kick_sample_table();
+    let snare_samples = get_snare_sample_table();
+    let hat_samples = get_hat_sample_table();
 
     // --- fill_buffer (已回退到 FM 版本) ---
     let mut fill_buffer = |buffer: &mut [u16; HALF_DMA_LEN],
@@ -422,7 +504,8 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
                            amp: f32, // 这是 FM 的 amp
                            cp: &mut f32,
                            mp: &mut f32,
-                           dsp: &mut usize, // (新!) 鼓采样指针
+                           current_drum: &mut Option<DrumSample>,
+                           drum_pos: &mut usize,
                            on: bool,
                            hdl: &mut [i16; HAAS_DELAY_SIZE],
                            hwp: &mut usize,
@@ -469,10 +552,22 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
 
             // 鼓采样
             let mut drum_sample_f32 = 0.0;
-            if *dsp < KICK_SAMPLE_LEN {
-                // 如果指针在采样范围内
-                drum_sample_f32 = kick_sample_table[*dsp];
-                *dsp += 1; // 推进指针
+            if let Some(drum_type) = current_drum {
+                // 根据当前鼓类型获取对应的采样表和长度
+                let (samples, max_len) = match drum_type {
+                    DrumSample::Kick => (kick_samples.as_slice(), KICK_SAMPLE_LEN),
+                    DrumSample::Snare => (snare_samples.as_slice(), SNARE_SAMPLE_LEN),
+                    DrumSample::Hat => (hat_samples.as_slice(), HAT_SAMPLE_LEN),
+                };
+
+                if *drum_pos < max_len {
+                    drum_sample_f32 = samples[*drum_pos];
+                    *drum_pos += 1;
+                } else {
+                    // 采样播放结束，重置状态
+                    *current_drum = None;
+                    *drum_pos = 0;
+                }
             }
 
             // --- 3. 放大器 (Amp) ---
@@ -519,7 +614,8 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         amplitude,
         &mut carrier_phase,
         &mut modulator_phase,
-        &mut drum_sample_ptr, // (新!)
+        &mut current_drum,  // 传入Option<DrumSample>
+        &mut drum_pos,      // 传入通用位置指针
         is_on,
         haas_delay_line,
         &mut haas_write_ptr,
@@ -533,7 +629,8 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         amplitude,
         &mut carrier_phase,
         &mut modulator_phase,
-        &mut drum_sample_ptr, // (新!)
+        &mut current_drum,  // 同上
+        &mut drum_pos,
         is_on,
         haas_delay_line,
         &mut haas_write_ptr,
@@ -546,6 +643,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     let mut write_future = i2s.write(&audio_buffers[current_buffer_idx]);
 
     loop {
+       
         // ... (match write_future.await... 错误处理不变) ...
         match write_future.await {
             Ok(_) => {}
@@ -596,16 +694,10 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         if let Ok(new_waves) = WAVE_PARAMS_CHANNEL.try_receive() {
             wave_params = new_waves;
         }
-        while let Ok(drum_cmd) = synth::DRUM_CHANNEL.try_receive() {
-            match drum_cmd {
-                DrumSample::Kick => {
-                    if drum_sample_ptr >= KICK_SAMPLE_LEN {
-                        // (新!) 避免自我重叠
-                        drum_sample_ptr = 0; // 重置指针以开始播放
-                    }
-                }
-                _ => {} // (Snare/Hat 待办)
-            }
+         while let Ok(drum) = synth::DRUM_CHANNEL.try_receive() {
+            // 直接用收到的DrumSample更新当前状态，中断现有播放
+            current_drum = Some(drum);
+            drum_pos = 0; // 重置指针
         }
         while let Ok(command) = AUDIO_CHANNEL.try_receive() {
             match command {
@@ -628,7 +720,8 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             amplitude,
             &mut carrier_phase,
             &mut modulator_phase,
-            &mut drum_sample_ptr, // (新!)
+            &mut current_drum, // 传入Option<DrumSample>
+            &mut drum_pos,
             is_on,
             haas_delay_line,
             &mut haas_write_ptr,
@@ -645,7 +738,6 @@ const fn wave_to_short_str(wave: Waveform) -> &'static str {
         Waveform::Square => "SQU",
     }
 }
-
 
 fn cheap_saturator(x: f32) -> f32 {
     x / (1.0 + x.abs())
