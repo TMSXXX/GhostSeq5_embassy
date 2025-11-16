@@ -3,7 +3,7 @@
 
 mod synth;
 // (已回退) 导入 FM_PARAM_CHANNEL, FmParams
-use crate::synth::{FmParams, FM_PARAM_CHANNEL, UiState}; 
+use crate::synth::{DRUM_CHANNEL, DrumSample, FM_PARAM_CHANNEL, FmParams, UiState};
 use core::fmt::Write;
 use cortex_m::peripheral::SCB;
 use defmt::*;
@@ -56,11 +56,16 @@ static AUDIO_BUFFERS: StaticCell<[[u16; HALF_DMA_LEN]; 2]> = StaticCell::new();
 const HAAS_DELAY_MS: usize = 20;
 const HAAS_DELAY_SIZE: usize = (48000 * HAAS_DELAY_MS) / 1000; // 960
 static HAAS_DELAY_LINE: StaticCell<[i16; HAAS_DELAY_SIZE]> = StaticCell::new();
+
 const WAVE_TABLE_SIZE: usize = 1024;
 static SINE_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
 static SQUARE_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
 static SAWTOOTH_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
 static TRIANGLE_TABLE: OnceCell<[f32; WAVE_TABLE_SIZE]> = OnceCell::new();
+
+const KICK_SAMPLE_LEN: usize = 2048;
+static KICK_SAMPLE_TABLE: OnceCell<[f32; KICK_SAMPLE_LEN]> = OnceCell::new();
+
 fn get_sine_table() -> &'static [f32; WAVE_TABLE_SIZE] {
     SINE_TABLE.get_or_init(|| {
         let mut table = [0.0f32; WAVE_TABLE_SIZE];
@@ -108,6 +113,37 @@ fn get_triangle_table() -> &'static [f32; WAVE_TABLE_SIZE] {
             }
         }
         info!("Triangle table (1024 samples) generated.");
+        table
+    })
+}
+
+fn get_kick_sample_table() -> &'static [f32; KICK_SAMPLE_LEN] {
+    KICK_SAMPLE_TABLE.get_or_init(|| {
+        let mut table = [0.0f32; KICK_SAMPLE_LEN];
+        let mut freq = 200.0; // 起始频率
+        let mut phase = 0.0;
+
+        for i in 0..KICK_SAMPLE_LEN {
+            // 1. 振荡器 (Sine)
+            let sample = phase.sin();
+
+            let drive = 3.0; // 提升 3 倍增益
+            let distorted_sample = cheap_saturator(sample * drive);
+
+            // 2. 音高包络 (非常快地下降)
+            freq *= 0.999; // 频率指数衰减
+            let phase_inc = (2.0 * PI * freq) / 48000.0;
+            phase += phase_inc;
+            if phase > (2.0 * PI) {
+                phase -= 2.0 * PI;
+            }
+
+            // 3. 音量包络 (线性衰减)
+            let amp_env = 1.0 - (i as f32 / KICK_SAMPLE_LEN as f32);
+
+            table[i] = distorted_sample * amp_env;
+        }
+        info!("Kick sample table (2048 samples) generated.");
         table
     })
 }
@@ -166,7 +202,8 @@ async fn main(spawner: Spawner) {
         (*scb).shpr[11].write(Priority::P6.into());
     }
     enable_fpu();
-    let config = { //
+    let config = {
+        //
         use embassy_stm32::rcc::*;
         let mut config = embassy_stm32::Config::default();
         config.rcc.hse = Some(Hse {
@@ -226,7 +263,13 @@ async fn main(spawner: Spawner) {
     let enc_b = ExtiInput::new(p.PA8, p.EXTI8, Pull::Up);
     let enc_sw = ExtiInput::new(p.PA10, p.EXTI10, Pull::Up);
     let i2s = i2s::I2S::new_txonly_nomck(
-        p.SPI3, p.PB5, p.PA15, p.PB3, p.DMA1_CH7, DMA_BUF_CELL.init([0u16; AUDIO_DMA_BUF_SIZE]), i2s_config,
+        p.SPI3,
+        p.PB5,
+        p.PA15,
+        p.PB3,
+        p.DMA1_CH7,
+        DMA_BUF_CELL.init([0u16; AUDIO_DMA_BUF_SIZE]),
+        i2s_config,
     );
     info!("I2S configured.");
     display.init().unwrap();
@@ -236,16 +279,19 @@ async fn main(spawner: Spawner) {
     get_sawtooth_table();
     get_square_table();
     get_triangle_table();
+    get_kick_sample_table();
     interrupt::TIM2.set_priority(Priority::P3);
     let spawner_high = EXECUTOR_HIGH.start(interrupt::TIM2);
     interrupt::TIM3.set_priority(Priority::P7);
     let spawner_med = EXECUTOR_MED.start(interrupt::TIM3);
-    
+
     // (Spawners 不变, audio_task 已恢复)
     spawner.spawn(oled_task(display)).unwrap();
     spawner_med.spawn(synth::adc_task(adc, p.PB0)).unwrap();
     spawner_med.spawn(synth::control_task(keys)).unwrap();
-    spawner_med.spawn(synth::encoder_task(enc_a, enc_b, enc_sw)).unwrap();
+    spawner_med
+        .spawn(synth::encoder_task(enc_a, enc_b, enc_sw))
+        .unwrap();
     spawner_high.spawn(audio_task(i2s)).unwrap();
 
     info!("All tasks started, system ready!");
@@ -329,7 +375,6 @@ async fn oled_task(mut display: OledDisplay) {
     }
 }
 
-
 #[embassy_executor::task()]
 async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     info!("Audio task starting...");
@@ -366,20 +411,22 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     let square_table = SQUARE_TABLE.get().unwrap();
     let triangle_table = TRIANGLE_TABLE.get().unwrap();
 
+    let kick_sample_table = KICK_SAMPLE_TABLE.get().unwrap();
+    let mut drum_sample_ptr: usize = KICK_SAMPLE_LEN;
 
     // --- fill_buffer (已回退到 FM 版本) ---
     let mut fill_buffer = |buffer: &mut [u16; HALF_DMA_LEN],
                            freq: f32,
-                           p: &FmParams, // (已恢复)
+                           p: &FmParams,
                            wp: &WaveParams,
-                           amp: f32,
+                           amp: f32, // 这是 FM 的 amp
                            cp: &mut f32,
-                           mp: &mut f32, // (已恢复)
+                           mp: &mut f32,
+                           dsp: &mut usize, // (新!) 鼓采样指针
                            on: bool,
                            hdl: &mut [i16; HAAS_DELAY_SIZE],
                            hwp: &mut usize,
                            haas_on: bool| {
-        
         // (已恢复 FM 逻辑)
         let carrier_freq = freq;
         let modulator_freq = carrier_freq * p.ratio;
@@ -387,20 +434,18 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         let modulator_phase_increment = (TWO_PI * modulator_freq) / 48000.0;
 
         for i in 0..SAMPLES_PER_BUFFER {
-            let sample_f32 = if on {
-                
+            let fm_sample_f32 = if on {
                 // (调制波 B)
                 let mod_phase_rads = *mp;
                 let mod_index_f32 = (mod_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32;
                 let mod_idx0 = (mod_index_f32 as i32) as usize & TABLE_MASK;
 
-                let mod_val =
-                    match wp.mod_wave {
-                        Waveform::Sine => sine_table[mod_idx0],
-                        Waveform::Triangle => triangle_table[mod_idx0],
-                        Waveform::Sawtooth => sawtooth_table[mod_idx0],
-                        Waveform::Square => square_table[mod_idx0],
-                    };
+                let mod_val = match wp.mod_wave {
+                    Waveform::Sine => sine_table[mod_idx0],
+                    Waveform::Triangle => triangle_table[mod_idx0],
+                    Waveform::Sawtooth => sawtooth_table[mod_idx0],
+                    Waveform::Square => square_table[mod_idx0],
+                };
 
                 let phase_offset = mod_val * p.index;
                 let mut carrier_phase_rads = *cp + phase_offset;
@@ -418,13 +463,21 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
                     Waveform::Sawtooth => sawtooth_table[carrier_idx0],
                     Waveform::Square => square_table[carrier_idx0],
                 }
-                
             } else {
                 0.0
             };
 
+            // 鼓采样
+            let mut drum_sample_f32 = 0.0;
+            if *dsp < KICK_SAMPLE_LEN {
+                // 如果指针在采样范围内
+                drum_sample_f32 = kick_sample_table[*dsp];
+                *dsp += 1; // 推进指针
+            }
+
             // --- 3. 放大器 (Amp) ---
-            let mono_sample_i16 = (sample_f32 * amp * 32767.0) as i16;
+            let mixed_sample_f32 = (fm_sample_f32 * amp * 0.7) + (drum_sample_f32 * 0.7);
+            let mono_sample_i16 = (mixed_sample_f32 * 32767.0) as i16;
 
             // ... (Haas 和 相位推进 逻辑不变) ...
             let read_ptr = *hwp;
@@ -460,15 +513,31 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     // --- 预填充 (已回退) ---
     fill_buffer(
         &mut audio_buffers[0],
-        frequency, &params, &wave_params, amplitude,
-        &mut carrier_phase, &mut modulator_phase, is_on,
-        haas_delay_line, &mut haas_write_ptr, haas_active,
+        frequency,
+        &params,
+        &wave_params,
+        amplitude,
+        &mut carrier_phase,
+        &mut modulator_phase,
+        &mut drum_sample_ptr, // (新!)
+        is_on,
+        haas_delay_line,
+        &mut haas_write_ptr,
+        haas_active,
     );
     fill_buffer(
         &mut audio_buffers[1],
-        frequency, &params, &wave_params, amplitude,
-        &mut carrier_phase, &mut modulator_phase, is_on,
-        haas_delay_line, &mut haas_write_ptr, haas_active,
+        frequency,
+        &params,
+        &wave_params,
+        amplitude,
+        &mut carrier_phase,
+        &mut modulator_phase,
+        &mut drum_sample_ptr, // (新!)
+        is_on,
+        haas_delay_line,
+        &mut haas_write_ptr,
+        haas_active,
     );
 
     // ... (i2s.start(), write_future 不变) ...
@@ -512,10 +581,10 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         write_future = i2s.write(buf_to_write);
         // --- S 关键路径结束 ---
 
-
         // --- 非关键路径 (已回退) ---
         // (移除了 MOD_ENV 和 FILTER_PARAMS)
-        if let Ok(new_params) = FM_PARAM_CHANNEL.try_receive() { // (已恢复)
+        if let Ok(new_params) = FM_PARAM_CHANNEL.try_receive() {
+            // (已恢复)
             params = new_params;
         }
         if let Ok(new_amp) = AMP_CHANNEL.try_receive() {
@@ -526,6 +595,17 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         }
         if let Ok(new_waves) = WAVE_PARAMS_CHANNEL.try_receive() {
             wave_params = new_waves;
+        }
+        while let Ok(drum_cmd) = synth::DRUM_CHANNEL.try_receive() {
+            match drum_cmd {
+                DrumSample::Kick => {
+                    if drum_sample_ptr >= KICK_SAMPLE_LEN {
+                        // (新!) 避免自我重叠
+                        drum_sample_ptr = 0; // 重置指针以开始播放
+                    }
+                }
+                _ => {} // (Snare/Hat 待办)
+            }
         }
         while let Ok(command) = AUDIO_CHANNEL.try_receive() {
             match command {
@@ -548,6 +628,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             amplitude,
             &mut carrier_phase,
             &mut modulator_phase,
+            &mut drum_sample_ptr, // (新!)
             is_on,
             haas_delay_line,
             &mut haas_write_ptr,
@@ -556,7 +637,6 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     }
 }
 
-
 const fn wave_to_short_str(wave: Waveform) -> &'static str {
     match wave {
         Waveform::Sine => "SINE",
@@ -564,4 +644,9 @@ const fn wave_to_short_str(wave: Waveform) -> &'static str {
         Waveform::Sawtooth => "SAW",
         Waveform::Square => "SQU",
     }
+}
+
+
+fn cheap_saturator(x: f32) -> f32 {
+    x / (1.0 + x.abs())
 }

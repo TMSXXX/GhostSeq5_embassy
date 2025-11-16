@@ -8,7 +8,7 @@ use embassy_stm32::adc::Adc;
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::gpio::Pin;
 use embassy_stm32::gpio::{AnyPin, Input, Level, Output, Pull, Speed};
-use embassy_stm32::peripherals::{ADC1, PB0}; 
+use embassy_stm32::peripherals::{ADC1, PB0};
 use embassy_stm32::peripherals::{PA8, PA9, PA10};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::{Duration, Instant, Ticker, Timer};
@@ -16,17 +16,8 @@ use heapless::String;
 use micromath::F32Ext;
 
 use crate::{
-    AMP_CHANNEL, 
-    AUDIO_CHANNEL,
-    AudioCommand,
-    WAVE_PARAMS_CHANNEL,
-    WAVE_TABLE_SIZE,
-    WaveParams,
-    Waveform,
-    get_sawtooth_table,
-    get_sine_table,
-    get_square_table,
-    get_triangle_table, 
+    AMP_CHANNEL, AUDIO_CHANNEL, AudioCommand, WAVE_PARAMS_CHANNEL, WAVE_TABLE_SIZE, WaveParams,
+    Waveform, get_sawtooth_table, get_sine_table, get_square_table, get_triangle_table,
 };
 
 // --- (新!) FM 合成器的参数 ---
@@ -36,12 +27,20 @@ pub struct FmParams {
     pub ratio: f32, // “音色” (0.5 - 5.0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DrumSample {
+    Kick,
+    Snare,
+    Hat,
+}
+
 const NOTE_FREQUENCIES: [f32; 8] = [
     261.63, 293.66, 329.63, 349.23, 392.00, 440.00, 493.88, 523.25,
 ];
 
 const SEMITONE_MULTIPLIERS: [f32; 13] = [
-    0.7491, 0.7937, 0.8409, 0.8909, 0.9439, 1.0, 1.0595, 1.1225, 1.1892, 1.2599, 1.3348, 1.4142, 1.4983,
+    0.7491, 0.7937, 0.8409, 0.8909, 0.9439, 1.0, 1.0595, 1.1225, 1.1892, 1.2599, 1.3348, 1.4142,
+    1.4983,
 ];
 const SEMITONE_SHIFT_OFFSET: i8 = 5;
 
@@ -52,10 +51,10 @@ pub type OledText = String<16>;
 pub static FM_PARAM_CHANNEL: Channel<CriticalSectionRawMutex, FmParams, 2> = Channel::new(); // (已恢复)
 pub static ENCODER_ROTARY_CHANNEL: Channel<CriticalSectionRawMutex, i8, 4> = Channel::new();
 pub static ENCODER_SWITCH_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
+pub static DRUM_CHANNEL: Channel<CriticalSectionRawMutex, DrumSample, 4> = Channel::new();
 pub static POT1_CHANNEL: Channel<CriticalSectionRawMutex, u16, 4> = Channel::new();
 pub static HAAS_STATE_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
 pub static UI_DASHBOARD_CHANNEL: Channel<CriticalSectionRawMutex, UiState, 2> = Channel::new();
-
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UiState {
@@ -86,7 +85,11 @@ struct NoteData {
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EnvelopeStage {
-    Idle, Attack, Decay, Sustain, Release,
+    Idle,
+    Attack,
+    Decay,
+    Sustain,
+    Release,
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Envelope {
@@ -197,18 +200,24 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
     let mut rows = rows.map(|pin| Output::new(pin, Level::High, Speed::Low));
     let cols = cols.map(|pin| Input::new(pin, Pull::Up));
     let mut last_key_state: [bool; 16] = [false; 16];
-    
+
     // --- 2. 合成器状态 (不变) ---
     let mut current_frequency = 0.0f32;
     let mut is_sharp_active = false;
     let mut octave_scale: usize = 2;
     let mut semitone_shift: i8 = 0;
     let mut note_keys_pressed: u8 = 0;
-    
+
     // --- 3. 音色状态 (已回退) ---
-    let mut current_params = FmParams { index: 0.0, ratio: 2.0 }; // (已恢复)
+    let mut current_params = FmParams {
+        index: 0.0,
+        ratio: 2.0,
+    }; // (已恢复)
     let mut max_fm_index: f32 = 2.0; // (已恢复)
-    let mut wave_params = WaveParams { carrier_wave: Waveform::Triangle, mod_wave: Waveform::Square };
+    let mut wave_params = WaveParams {
+        carrier_wave: Waveform::Triangle,
+        mod_wave: Waveform::Square,
+    };
     let mut is_haas_active = false;
     let mut is_shift_held = false;
 
@@ -224,7 +233,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
     amp_envelope.decay_ticks = 40.0;
     amp_envelope.sustain_level = 0.5;
     amp_envelope.release_ticks = 25.0;
-    
+
     // --- 6. Sequencer (音序器) 状态 (32步) ---
     let mut sequencer_mode = SequencerMode::Stop;
     let mut current_step: usize = 0;
@@ -232,14 +241,15 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
     let mut step_duration = Duration::from_millis(125);
     let mut last_tick_time = Instant::now();
     let mut sequence: [Option<NoteData>; 32] = [None; 32];
-    
+
     // --- 7. 功能键 ID (不变) ---
     const CARRIER_WAVE_ID: u8 = 11;
     const MOD_WAVE_ID: u8 = 10;
     const HAAS_TOGGLE_ID: u8 = 12;
     const PLAY_STOP_ID: u8 = 15;
+    const KICK_DRUM_ID: u8 = 9;
     const RECORD_ID: u8 = 14;
-    
+
     // (发送初始状态 ... 已回退)
     let _ = FM_PARAM_CHANNEL.try_send(current_params); // (已恢复)
     let _ = AMP_CHANNEL.try_send(0.0);
@@ -255,12 +265,22 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
         // --- 8A. 检查所有通道 (已回退) ---
         if let Ok(rotation) = crate::synth::ENCODER_ROTARY_CHANNEL.try_receive() {
             if is_shift_held {
-                semitone_shift += match rotation > 0 { true => 1, false => -1 };
+                semitone_shift += match rotation > 0 {
+                    true => 1,
+                    false => -1,
+                };
                 semitone_shift = semitone_shift.clamp(-5, 7);
                 // (Resonance 已移除)
             } else {
-                if rotation > 0 { if octave_scale < 4 { octave_scale += 1; } }
-                else { if octave_scale > 0 { octave_scale -= 1; } }
+                if rotation > 0 {
+                    if octave_scale < 4 {
+                        octave_scale += 1;
+                    }
+                } else {
+                    if octave_scale > 0 {
+                        octave_scale -= 1;
+                    }
+                }
             }
         }
         if let Ok(pressed) = crate::synth::ENCODER_SWITCH_CHANNEL.try_receive() {
@@ -276,7 +296,9 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
         for (r, row) in rows.iter_mut().enumerate() {
             row.set_low();
             for (c, col) in cols.iter().enumerate() {
-                if col.is_low() { current_key_state[r * 4 + c] = true; }
+                if col.is_low() {
+                    current_key_state[r * 4 + c] = true;
+                }
             }
             row.set_high();
         }
@@ -298,11 +320,14 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                             is_sharp: is_sharp_active,
                         };
                         if sequencer_mode == SequencerMode::Record {
-                             sequence[current_step] = Some(note_data);
+                            sequence[current_step] = Some(note_data);
                         }
                         let base_frequency = NOTE_FREQUENCIES[key_code as usize];
                         current_frequency = calculate_final_frequency(
-                            base_frequency, is_sharp_active, semitone_shift, octave_scale
+                            base_frequency,
+                            is_sharp_active,
+                            semitone_shift,
+                            octave_scale,
                         );
                         if note_keys_pressed == 1 {
                             fm_envelope.note_on(); // (已恢复)
@@ -310,7 +335,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                         }
                         let _ = AUDIO_CHANNEL.try_send(AudioCommand::Play(current_frequency));
                     }
-                    
+
                     // (功能键 不变)
                     CARRIER_WAVE_ID => {
                         wave_params.carrier_wave = match wave_params.carrier_wave {
@@ -320,6 +345,9 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                             Waveform::Square => Waveform::Sine,
                         };
                         let _ = WAVE_PARAMS_CHANNEL.try_send(wave_params);
+                    }
+                    KICK_DRUM_ID => {
+                        let _ = DRUM_CHANNEL.try_send(DrumSample::Kick);
                     }
                     MOD_WAVE_ID => {
                         wave_params.mod_wave = match wave_params.mod_wave {
@@ -340,11 +368,11 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                                 last_tick_time = Instant::now();
                                 current_step = 31;
                                 SequencerMode::Play
-                            },
+                            }
                             _ => {
                                 let _ = AUDIO_CHANNEL.try_send(AudioCommand::Stop);
                                 SequencerMode::Stop
-                            },
+                            }
                         };
                     }
                     RECORD_ID => {
@@ -367,8 +395,10 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                 }
             } else if key_released {
                 if key_code <= 7 && last_key_state[i] {
-                    if note_keys_pressed > 0 { note_keys_pressed -= 1; }
-                    
+                    if note_keys_pressed > 0 {
+                        note_keys_pressed -= 1;
+                    }
+
                     if note_keys_pressed == 0 {
                         amp_envelope.note_off();
                         fm_envelope.note_off(); // (已恢复)
@@ -377,24 +407,27 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
             }
         }
         last_key_state = current_key_state;
-        
+
         // --- 8D. BPM 时钟 (32步) ---
         let now = Instant::now();
-        if (sequencer_mode != SequencerMode::Stop) && (now.duration_since(last_tick_time) >= step_duration) {
-            
+        if (sequencer_mode != SequencerMode::Stop)
+            && (now.duration_since(last_tick_time) >= step_duration)
+        {
             last_tick_time = now;
             current_step = (current_step + 1) % 32;
-            
+
             if let Some(note) = sequence[current_step] {
                 let base_frequency = NOTE_FREQUENCIES[note.key_code as usize];
                 let final_freq = calculate_final_frequency(
-                    base_frequency, note.is_sharp, note.semitone, note.octave
+                    base_frequency,
+                    note.is_sharp,
+                    note.semitone,
+                    note.octave,
                 );
-                
+
                 fm_envelope.note_on(); // (已恢复)
                 amp_envelope.note_on();
                 let _ = AUDIO_CHANNEL.try_send(AudioCommand::Play(final_freq));
-            
             } else if note_keys_pressed == 0 {
                 amp_envelope.note_off();
                 fm_envelope.note_off(); // (已恢复)
@@ -404,15 +437,16 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
         // --- 8E. 运行包络 & 发送参数 (已回退) ---
         let fm_env_val = fm_envelope.tick(); // (已恢复)
         let amp_env_val = amp_envelope.tick();
-        
+
         current_params.index = fm_env_val * max_fm_index; // (已恢复)
-        
+
         let _ = FM_PARAM_CHANNEL.try_send(current_params); // (已恢复)
         let _ = AMP_CHANNEL.try_send(amp_env_val);
 
         // --- 8F. 停止播放逻辑 (不变) ---
-        if amp_envelope.is_idle() && note_keys_pressed == 0 && sequencer_mode == SequencerMode::Stop {
-             let _ = AUDIO_CHANNEL.try_send(AudioCommand::Stop);
+        if amp_envelope.is_idle() && note_keys_pressed == 0 && sequencer_mode == SequencerMode::Stop
+        {
+            let _ = AUDIO_CHANNEL.try_send(AudioCommand::Stop);
         }
 
         // --- 8G. 发送 UI 状态包 (已回退) ---
@@ -434,8 +468,6 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
     }
 }
 
-
-
 #[task]
 pub async fn adc_task(mut adc: Adc<'static, ADC1>, mut pin: Peri<'static, PB0>) {
     info!("ADC task (P15) started!");
@@ -449,8 +481,8 @@ pub async fn adc_task(mut adc: Adc<'static, ADC1>, mut pin: Peri<'static, PB0>) 
 // (encoder_task 已修复)
 #[task]
 pub async fn encoder_task(
-    mut clk_a: ExtiInput<'static>, 
-    mut dt_b: ExtiInput<'static>, 
+    mut clk_a: ExtiInput<'static>,
+    mut dt_b: ExtiInput<'static>,
     mut sw: ExtiInput<'static>,
 ) {
     info!("Encoder task (P7) started!");
@@ -468,7 +500,6 @@ pub async fn encoder_task(
         let tick = Timer::after_millis(5); // 我们的 5ms 去抖时钟
 
         match select(clk_fall, select(sw_edge, tick)).await {
-            
             // --- 旋转 (Either::First(...)) ---
             Either::First(_) => {
                 // clk_fall 触发了
@@ -488,7 +519,7 @@ pub async fn encoder_task(
                         // (中断触发了，我们重置计数器，等待 Ticker 确认)
                         sw_stable_counter = 0;
                     }
-                    
+
                     // --- 5ms Ticker 触发 (Either::Second(...)) ---
                     Either::Second(_) => {
                         // tick 触发了
