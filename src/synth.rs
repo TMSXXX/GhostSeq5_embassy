@@ -18,9 +18,6 @@ use crate::{
     AMP_CHANNEL, // <-- 修复：确保 AMP_CHANNEL 被导入
     AUDIO_CHANNEL,
     AudioCommand,
-    FREQUENCY_CHANNEL,
-    KEYBOARD_CHANNEL,
-    OLED_TEXT_CHANNEL,
     WAVE_PARAMS_CHANNEL,
     WAVE_TABLE_SIZE,
     WaveParams,
@@ -63,6 +60,20 @@ pub static ENCODER_ROTARY_CHANNEL: Channel<CriticalSectionRawMutex, i8, 4> = Cha
 pub static ENCODER_SWITCH_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
 pub static POT1_CHANNEL: Channel<CriticalSectionRawMutex, u16, 4> = Channel::new();
 pub static HAAS_STATE_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
+pub static UI_DASHBOARD_CHANNEL: Channel<CriticalSectionRawMutex, UiState, 2> = Channel::new();
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UiState {
+    pub octave: usize,
+    pub semitone: i8,
+    pub fm_index: f32, // 当前 FM 指数 (0.0 - 10.0)
+    pub carrier_wave: Waveform,
+    pub mod_wave: Waveform,
+    pub is_shift_held: bool,
+    pub is_haas_active: bool,
+}
+
+
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EnvelopeStage {
@@ -184,7 +195,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
     let mut current_frequency = 0.0f32;
     let mut is_sharp_active = false;
     let mut octave_scale: usize = 2;
-    const MOD_WAVE_ID: u8 = 15; // <-- 新功能!
+    const MOD_WAVE_ID: u8 = 15;
     const CARRIER_WAVE_ID: u8 = 14;
     const OCTAVE_MULTI: [f32; 5] = [0.25, 0.5, 1., 2., 4.];
 
@@ -219,11 +230,6 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
     amp_envelope.sustain_level = 0.0; 
     amp_envelope.release_ticks = 25.0; 
 
-    // (发送初始状态 不变)
-    let _ = FREQUENCY_CHANNEL.try_send(0.0);
-    let mut status_text: String<16> = String::new();
-    core::write!(status_text, "Pluck...").unwrap();
-    let _ = OLED_TEXT_CHANNEL.try_send(status_text);
     let _ = FM_PARAM_CHANNEL.try_send(current_params);
     let _ = AMP_CHANNEL.try_send(0.0);
     let _ = HAAS_STATE_CHANNEL.try_send(is_haas_active);
@@ -266,33 +272,18 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                         octave_scale -= 1;
                     }
                 }
-                let mut text_to_send: String<16> = String::new();
-                core::write!(text_to_send, "Octave: {}", octave_scale).unwrap_or(());
-                let _ = OLED_TEXT_CHANNEL.try_send(text_to_send);
             }
         }
 
         // (检查 SHIFT 键)
         if let Ok(pressed) = crate::synth::ENCODER_SWITCH_CHANNEL.try_receive() {
             is_shift_held = pressed; // (true=按下, false=松开)
-
-            let mut text_to_send: String<16> = String::new();
-            core::write!(
-                text_to_send,
-                "SHIFT: {}",
-                if is_shift_held { "ON" } else { "OFF" }
-            )
-            .unwrap_or(());
-            let _ = OLED_TEXT_CHANNEL.try_send(text_to_send);
         }
 
         // 电位器
         if let Ok(pot_val) = crate::synth::POT1_CHANNEL.try_receive() {
             // 将 0-4095 (u16) 映射到 0.0-10.0 (f32)
             max_fm_index = (pot_val as f32 / 4096.0) * 10.0;
-            let mut pot_text: String<16> = String::new();
-            core::write!(pot_text, "FM Index: {}", (max_fm_index * 10.0) as i32).unwrap();
-            let _ = OLED_TEXT_CHANNEL.try_send(pot_text);
         }
 
         // 处理按键
@@ -310,9 +301,6 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
 
                         let base_frequency = NOTE_FREQUENCIES[key_code as usize];
 
-                        // -----------------------------------------------------------------
-                        // 修复 5: 应用“半音” (Semitone)
-                        // -----------------------------------------------------------------
                         let semitone_index = (semitone_shift + SEMITONE_SHIFT_OFFSET) as usize;
                         current_frequency = base_frequency * SEMITONE_MULTIPLIERS[semitone_index];
 
@@ -323,7 +311,6 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
 
                         current_frequency *= OCTAVE_MULTI[octave_scale];
                         let _ = AUDIO_CHANNEL.try_send(AudioCommand::Play(current_frequency));
-                        let _ = FREQUENCY_CHANNEL.try_send(current_frequency);
                     }
 
                     CARRIER_WAVE_ID => {
@@ -336,11 +323,6 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                             Waveform::Square => Waveform::Sine,
                         };
                         let _ = WAVE_PARAMS_CHANNEL.try_send(wave_params);
-
-                        let mut text_to_send: String<16> = String::new();
-                        core::write!(text_to_send, "Carrier: {:?}", wave_params.carrier_wave)
-                            .unwrap_or(());
-                        let _ = OLED_TEXT_CHANNEL.try_send(text_to_send);
                     }
 
                     MOD_WAVE_ID => {
@@ -353,30 +335,14 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                         };
                         let _ = WAVE_PARAMS_CHANNEL.try_send(wave_params);
 
-                        let mut text_to_send: String<16> = String::new();
-                        core::write!(text_to_send, "Mod: {:?}", wave_params.mod_wave).unwrap();
-                        let _ = OLED_TEXT_CHANNEL.try_send(text_to_send);
                     }
 
                     HAAS_TOGGLE_ID => {
                         is_haas_active = !is_haas_active; // 翻转状态
-                        let _ = HAAS_STATE_CHANNEL.try_send(is_haas_active);
-
-                        let mut text_to_send: String<16> = String::new();
-                        core::write!(
-                            text_to_send,
-                            "Haas FX: {}",
-                            if is_haas_active { "ON" } else { "OFF" }
-                        )
-                        .unwrap();
-                        let _ = OLED_TEXT_CHANNEL.try_send(text_to_send);
                     }
                     // (Key 13, 14, 15 备用)
                     _ => {
                         info!("Unassigned Func Key {}", key_code);
-                        let mut text_to_send: String<16> = String::new();
-                        core::write!(text_to_send, "Func Key {}", key_code).unwrap();
-                        let _ = OLED_TEXT_CHANNEL.try_send(text_to_send);
                     }
                 }
             } else if key_released {
@@ -388,10 +354,6 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
                     if note_keys_pressed == 0 {
                         fm_envelope.note_off();
                         amp_envelope.note_off();
-                        let _ = FREQUENCY_CHANNEL.try_send(0.0);
-                        let mut text_to_send: String<16> = String::new();
-                        core::write!(text_to_send, "Note Off").unwrap();
-                        let _ = OLED_TEXT_CHANNEL.try_send(text_to_send);
                     }
                 }
             }
@@ -404,9 +366,20 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
 
         current_params.index = fm_env_val * max_fm_index;
 
-        // 发送参数
-        let _ = FM_PARAM_CHANNEL.try_send(current_params);
-        let _ = AMP_CHANNEL.try_send(amp_env_val); // 发送音量
+        let ui_state = UiState {
+            octave: octave_scale,
+            semitone: semitone_shift,
+            fm_index: max_fm_index,
+            carrier_wave: wave_params.carrier_wave,
+            mod_wave: wave_params.mod_wave,
+            is_shift_held: is_shift_held,
+            is_haas_active: is_haas_active,
+        };
+        
+        // 最终发送
+        let _ = UI_DASHBOARD_CHANNEL.try_send(ui_state);
+        let _ = FM_PARAM_CHANNEL.try_send(current_params); 
+        let _ = crate::AMP_CHANNEL.try_send(amp_env_val);
 
         // 音量包络结束，stop
         if amp_envelope.is_idle() && note_keys_pressed == 0 {
