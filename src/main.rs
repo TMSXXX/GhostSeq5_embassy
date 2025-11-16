@@ -301,7 +301,9 @@ async fn main(spawner: Spawner) {
     spawner.spawn(synth::adc_task(adc, p.PB0)).unwrap();
 
     // MEDIUM (P7):
-    spawner_med.spawn(synth::control_task(keys)).unwrap(); // <-- 调用新模块的任务
+    spawner_med.spawn(synth::control_task(
+        keys
+    )).unwrap();
     spawner_med
         .spawn(synth::encoder_task(enc_a, enc_b, enc_sw))
         .unwrap();
@@ -415,6 +417,7 @@ async fn oled_task(mut display: OledDisplay) {
 async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     info!("Audio task starting...");
 
+    // (状态变量初始化不变)
     let mut frequency = 100.0f32;
     let mut is_on = false;
     let mut carrier_phase: f32 = 0.0;
@@ -436,21 +439,23 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     let mut haas_write_ptr: usize = 0;
     let mut haas_active: bool = false;
 
+    // (常量定义不变)
     const TABLE_MASK: usize = WAVE_TABLE_SIZE - 1;
     const TABLE_SIZE_F32: f32 = WAVE_TABLE_SIZE as f32;
     const TWO_PI: f32 = 2.0 * PI;
     const TWO_PI_INV: f32 = 0.15915494;
 
-    // 提前获取波表
+    // (获取波表不变)
     let sine_table = SINE_TABLE.get().unwrap();
     let sawtooth_table = SAWTOOTH_TABLE.get().unwrap();
     let square_table = SQUARE_TABLE.get().unwrap();
     let triangle_table = TRIANGLE_TABLE.get().unwrap();
 
+    // (fill_buffer 闭包的定义)
     let mut fill_buffer = |buffer: &mut [u16; HALF_DMA_LEN],
                            freq: f32,
                            p: &synth::FmParams,
-                           wp: &WaveParams, // <-- 传入波形参数
+                           wp: &WaveParams, 
                            amp: f32,
                            cp: &mut f32,
                            mp: &mut f32,
@@ -458,20 +463,22 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
                            hdl: &mut [i16; HAAS_DELAY_SIZE],
                            hwp: &mut usize,
                            haas_on: bool| {
+        
+        // (相位增量计算不变)
         let carrier_freq = freq;
         let modulator_freq = carrier_freq * p.ratio;
         let carrier_phase_increment = (TWO_PI * carrier_freq) / 48000.0;
         let modulator_phase_increment = (TWO_PI * modulator_freq) / 48000.0;
 
         for i in 0..SAMPLES_PER_BUFFER {
-            // 计算单声道
+            // --- 采样计算 (已修改) ---
             let sample_f32 = if on {
-                // (调制波 B)
+                // (调制波 B - 不变, 本来就没有插值)
                 let mod_phase_rads = *mp;
                 let mod_index_f32 = (mod_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32;
                 let mod_idx0 = (mod_index_f32 as i32) as usize & TABLE_MASK;
 
-                let mod_val = //triangle_table[mod_idx0];
+                let mod_val =
                     match wp.mod_wave {
                         Waveform::Sine => sine_table[mod_idx0],
                         Waveform::Triangle => triangle_table[mod_idx0],
@@ -485,30 +492,40 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
                     carrier_phase_rads += TWO_PI;
                 }
 
-                // (载波 A)
-                let carrier_index_f32 = (carrier_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32;
-                let carrier_index_trunc_int = carrier_index_f32 as i32;
-                let carrier_index_trunc = carrier_index_trunc_int as f32;
-                let carrier_index_frac = carrier_index_f32 - carrier_index_trunc;
-                let carrier_idx0 = carrier_index_trunc_int as usize;
-                let carrier_idx0_wrapped = carrier_idx0 & TABLE_MASK;
-                let carrier_idx1_wrapped = (carrier_idx0 + 1) & TABLE_MASK;
+                // ----------------------------------------------------
+                // <<< 修复：移除线性插值 >>>
+                // ----------------------------------------------------
 
-                let (val0, val1) = //(sine_table[carrier_idx0_wrapped], sine_table[carrier_idx1_wrapped]);
-                    match wp.carrier_wave {
-                        Waveform::Sine => (sine_table[carrier_idx0_wrapped], sine_table[carrier_idx1_wrapped]),
-                        Waveform::Triangle => (triangle_table[carrier_idx0_wrapped], triangle_table[carrier_idx1_wrapped]),
-                        Waveform::Sawtooth => (sawtooth_table[carrier_idx0_wrapped], sawtooth_table[carrier_idx1_wrapped]),
-                        Waveform::Square => (square_table[carrier_idx0_wrapped], square_table[carrier_idx1_wrapped]),
-                    };
-                (val1 - val0).mul_add(carrier_index_frac, val0)
+                // (载波 A - 已移除线性插值)
+                let carrier_index_f32 = (carrier_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32;
+                // 我们不再需要 frac, val0, val1
+                // let carrier_index_trunc_int = carrier_index_f32 as i32;
+                // let carrier_index_trunc = carrier_index_trunc_int as f32;
+                // let carrier_index_frac = carrier_index_f32 - carrier_index_trunc;
+                
+                let carrier_idx0 = (carrier_index_f32 as i32) as usize; // (简化)
+                let carrier_idx0_wrapped = carrier_idx0 & TABLE_MASK;
+                // let carrier_idx1_wrapped = (carrier_idx0 + 1) & TABLE_MASK; // (不再需要)
+
+                // (旧的插值代码 - 已删除)
+                // let (val0, val1) = match ...
+                // (val1 - val0).mul_add(carrier_index_frac, val0)
+
+                // (新的：直接查找)
+                match wp.carrier_wave {
+                    Waveform::Sine => sine_table[carrier_idx0_wrapped],
+                    Waveform::Triangle => triangle_table[carrier_idx0_wrapped],
+                    Waveform::Sawtooth => sawtooth_table[carrier_idx0_wrapped],
+                    Waveform::Square => square_table[carrier_idx0_wrapped],
+                }
+                
             } else {
                 0.0
             };
 
+            // (单声道转立体声 & Haas 效应 - 不变)
             let mono_sample_i16 = (sample_f32 * amp * 32767.0) as i16;
 
-            // (Haas 效应 不变)
             let read_ptr = *hwp;
             let delayed_sample_i16 = hdl[read_ptr];
             hdl[read_ptr] = mono_sample_i16;
@@ -525,7 +542,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
                 buffer[i * 2 + 1] = mono_sample_i16 as u16;
             }
 
-            // (推进相位 不变)
+            // (推进相位 - 不变)
             *cp += carrier_phase_increment;
             *mp += modulator_phase_increment;
             if *cp > TWO_PI {
@@ -540,9 +557,9 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             *cp = 0.0;
             *mp = 0.0;
         }
-    };
+    }; // (fill_buffer 闭包结束)
 
-    // (预填充)
+    // (预填充 - 不变)
     fill_buffer(
         &mut audio_buffers[0],
         frequency,
@@ -576,10 +593,12 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     let mut write_future = i2s.write(&audio_buffers[current_buffer_idx]);
 
     loop {
+        // --- 1. 等待上一个 DMA 周期完成 ---
         match write_future.await {
             Ok(_) => {}
             Err(e) => {
                 error!("I2S write error: {:?}", e);
+                // (错误处理逻辑不变)
                 audio_buffers[0].fill(0);
                 audio_buffers[1].fill(0);
                 carrier_phase = 0.0;
@@ -588,13 +607,14 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
                 i2s.clear();
                 haas_delay_line.fill(0);
                 haas_write_ptr = 0;
-                //is_on = false;
                 write_future = i2s.write(&audio_buffers[current_buffer_idx]);
                 continue;
             }
         }
 
-        // (缓冲区拆分逻辑 不变)
+        // --- 2. 关键路径：交换缓冲区并立即启动下一次写入 ---
+        
+        // (缓冲区拆分逻辑不变)
         let (buf0_slice, buf1_slice) = audio_buffers.split_at_mut(1);
         let buf0 = &mut buf0_slice[0];
         let buf1 = &mut buf1_slice[0];
@@ -608,7 +628,13 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             buf_to_fill = buf0;
         }
 
-        // (P3 消息接收逻辑 不变)
+        write_future = i2s.write(buf_to_write);
+        // --- 关键路径结束 ---
+
+
+        // --- 3. 非关键路径：在 DMA 运行时，安全地接收消息并填充 *下一个* 缓冲区 ---
+        
+        // (接收消息 - 不变)
         if let Ok(new_params) = synth::FM_PARAM_CHANNEL.try_receive() {
             params = new_params;
         }
@@ -633,13 +659,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             }
         }
 
-        if !is_on {
-            buf_to_write.fill(0);
-        }
-
-        write_future = i2s.write(buf_to_write);
-
-        // (填充缓冲区)
+        // (填充 buf_to_fill - 不变)
         fill_buffer(
             buf_to_fill,
             frequency,
@@ -648,7 +668,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             amplitude,
             &mut carrier_phase,
             &mut modulator_phase,
-            is_on,
+            is_on, 
             haas_delay_line,
             &mut haas_write_ptr,
             haas_active,

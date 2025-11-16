@@ -118,6 +118,8 @@ struct Envelope {
     release_start_value: f32,
 }
 
+
+
 // 在 src/synth.rs 中
 
 impl Envelope {
@@ -186,6 +188,8 @@ impl Envelope {
         matches!(self.stage, EnvelopeStage::Idle)
     }
 }
+
+
 
 fn calculate_final_frequency(
     base_frequency: f32,
@@ -294,13 +298,6 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
         let mut current_key_state: [bool; 16] = [false; 16];
         for (r, row) in rows.iter_mut().enumerate() {
             row.set_low();
-            // Timer::after_micros(10).await; // <-- 核心修复 2: 移除这个 AWAIT！
-            // 对于 5ms 的循环来说，10µs 的延时既没必要，也会引入不必要的 await。
-            // GPIO 足够快，不需要延时。
-            // 如果你 *一定* 需要延时，请使用
-            // embassy_time::Timer::after_micros(10).await 仍然会引入异步，
-            // 应该用 `cortex_m::delay::Delay::delay_us(10)` 这样的 *阻塞* 延时
-            // (但在这里，最好的选择是 *什么都不加*)
 
             for (c, col) in cols.iter().enumerate() {
                 if col.is_low() { current_key_state[r * 4 + c] = true; }
@@ -484,6 +481,8 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2]) {
         ticker.next().await; // <-- (新的) 确保 5ms 周期
     }
 }
+
+
 
 #[task]
 pub async fn adc_task(mut adc: Adc<'static, ADC1>, mut pin: Peri<'static, PB0>) {
