@@ -154,7 +154,7 @@ pub struct WaveParams {
 
 static AUDIO_CHANNEL: Channel<CriticalSectionRawMutex, AudioCommand, 4> = Channel::new();
 static AMP_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
-static WAVE_PARAMS_CHANNEL: Channel<CriticalSectionRawMutex, WaveParams, 2> = Channel::new();
+static WAVE_PARAMS_CHANNEL: Channel<CriticalSectionRawMutex, WaveParams, 4> = Channel::new();
 
 static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
 static EXECUTOR_MED: InterruptExecutor = InterruptExecutor::new();
@@ -333,6 +333,8 @@ async fn oled_task(mut display: OledDisplay) {
     let mut key_text: String<16> = String::new();
     core::write!(key_text, "Init...").unwrap();
     let mut ui_state = synth::UiState {
+        mode: synth::SequencerMode::Stop,
+        step: 0,
         octave: 2,
         semitone: 0,
         fm_index: 0.0,
@@ -346,10 +348,19 @@ async fn oled_task(mut display: OledDisplay) {
     display.clear(BinaryColor::Off).unwrap();
     display.flush().unwrap();
 
+    let mut ticker = embassy_time::Ticker::every(embassy_time::Duration::from_millis(100));
+
     loop {
         // --- 1. 等待 P7 任务发送的完整 UI 状态包 ---
-        let new_state = synth::UI_DASHBOARD_CHANNEL.receive().await;
-        ui_state = new_state;
+        let mut last_state_received = None;
+        while let Ok(state) = synth::UI_DASHBOARD_CHANNEL.try_receive() {
+            last_state_received = Some(state);
+        }
+
+        // 如果我们收到了新状态，就更新它
+        if let Some(new_state) = last_state_received {
+            ui_state = new_state;
+        }
 
         // 清除屏幕 (保持这个，否则屏幕会越来越乱)
         Rectangle::new(Point::new(0, 0), Size::new(128, 64))
@@ -394,7 +405,7 @@ async fn oled_task(mut display: OledDisplay) {
         display.flush().unwrap(); // 仍旧阻塞 25ms，但 CPU 计算时间极短
 
         // 慢速循环 (10 FPS)
-        Timer::after_millis(20).await;
+        ticker.next().await; // <-- (新的)
     }
 }
 
@@ -644,6 +655,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         );
     }
 }
+
 
 const fn wave_to_short_str(wave: Waveform) -> &'static str {
     match wave {
