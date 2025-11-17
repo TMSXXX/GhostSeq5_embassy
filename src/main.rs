@@ -154,7 +154,7 @@ fn get_kick_sample_table() -> &'static [f32; KICK_SAMPLE_LEN] {
 fn get_snare_sample_table() -> &'static [f32; SNARE_SAMPLE_LEN] {
     SNARE_SAMPLE_TABLE.get_or_init(|| {
         let mut table = [0.0f32; SNARE_SAMPLE_LEN];
-        let mut tone_freq = 250.0; // 军鼓基础音高（高于底鼓）
+        let mut tone_freq = 200.0; // 军鼓基础音高（高于底鼓）
         let mut phase = 0.0;
         let mut noise_seed = 42u32; // 用于生成伪随机噪音的种子
 
