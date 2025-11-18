@@ -6,57 +6,33 @@ mod synth;
 mod wavetable;
 use crate::dsp::cheap_saturator;
 use crate::synth::{
-    DRUM_CHANNEL, DrumSample, FM_PARAM_CHANNEL, FmParams, MASTER_DRIVE_CHANNEL, UiState,
+    DRUM_CHANNEL, DrumSample, FM_PARAM_CHANNEL, FmParams, MASTER_DRIVE_CHANNEL,
 };
 use crate::wavetable::{
     HAT_SAMPLE_LEN, KICK_SAMPLE_LEN, SNARE_SAMPLE_LEN, WAVE_TABLE_SIZE, WaveParams, Waveform,
     get_hat_sample_table, get_kick_sample_table, get_sawtooth_table, get_sine_table,
     get_snare_sample_table, get_square_table, get_triangle_table,
 };
-use core::fmt::Write;
 use cortex_m::peripheral::SCB;
 use defmt::*;
 use embassy_executor::{Executor, InterruptExecutor, Spawner};
-use embassy_futures::select::{Either, select};
 use embassy_stm32::{
     Peri,
     adc::{Adc, SampleTime},
-    bind_interrupts,
     exti::ExtiInput,
     gpio::{AnyPin, Input, Level, Output, Pin, Pull, Speed},
-    i2c::{self, I2c},
     i2s,
     interrupt::{self, InterruptExt, Priority},
-    peripherals,
     time::Hertz,
-    timer,
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::Timer;
-use heapless::String;
-use micromath::F32Ext;
-use once_cell::sync::OnceCell;
 use static_cell::StaticCell;
 
 use {defmt_rtt as _, panic_probe as _};
 
 use core::f32::consts::PI;
-use embedded_graphics::prelude::*;
-use embedded_graphics::text::Text;
-use embedded_graphics::{
-    mono_font::MonoTextStyle,
-    primitives::{Line, PrimitiveStyle},
-};
-use embedded_graphics::{mono_font::ascii::FONT_6X10, text::Baseline};
-use embedded_graphics::{pixelcolor::BinaryColor, primitives::Rectangle};
-use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
-type OledDisplay = Ssd1306<
-    I2CInterface<I2c<'static, embassy_stm32::mode::Async, embassy_stm32::i2c::Master>>,
-    DisplaySize128x64,
-    ssd1306::mode::BufferedGraphicsMode<DisplaySize128x64>,
->;
-type OledText = String<16>;
 const AUDIO_DMA_BUF_SIZE: usize = 2400;
 static DMA_BUF_CELL: StaticCell<[u16; AUDIO_DMA_BUF_SIZE]> = StaticCell::new();
 const HALF_DMA_LEN: usize = AUDIO_DMA_BUF_SIZE / 2; // 1200
@@ -99,12 +75,6 @@ unsafe fn TIM5() {
     EXECUTOR_LOW.on_interrupt();
 }
 
-bind_interrupts!(
-    struct Irqs {
-        I2C1_EV => i2c::EventInterruptHandler<peripherals::I2C1>;
-        I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
-    }
-);
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // (FPU, Config, Init ... 不变)
@@ -151,18 +121,6 @@ async fn main(spawner: Spawner) {
 
     info!("System starting...");
     Timer::after_millis(100).await;
-    let mut i2c_config = embassy_stm32::i2c::Config::default();
-    i2c_config.frequency = Hertz(400_000);
-    i2c_config.sda_pullup = true;
-    i2c_config.scl_pullup = true;
-    let i2c = I2c::new(
-        p.I2C1, p.PB8, p.PB9, Irqs, p.DMA1_CH1, p.DMA1_CH0, i2c_config,
-    );
-    info!("I2C initialized.");
-    let interface = I2CDisplayInterface::new(i2c);
-    let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
-        .into_buffered_graphics_mode();
-    info!("OLED display created.");
     let keys: [[Peri<'static, AnyPin>; 4]; 2] = [
         [p.PA3.into(), p.PA2.into(), p.PA1.into(), p.PA0.into()],
         [p.PA7.into(), p.PA6.into(), p.PA5.into(), p.PA4.into()],
@@ -192,9 +150,6 @@ async fn main(spawner: Spawner) {
         i2s_config,
     );
     info!("I2S configured.");
-    display.init().unwrap();
-    display.clear(BinaryColor::Off).unwrap();
-    display.flush().unwrap();
     get_sine_table();
     get_sawtooth_table();
     get_square_table();
@@ -230,88 +185,7 @@ fn enable_fpu() {
 }
 
 // (oled_task 不变)
-#[embassy_executor::task]
-async fn oled_task(mut display: OledDisplay) {
-    info!("OLED task started!");
-    let text_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
-    let clear_style = PrimitiveStyle::with_fill(BinaryColor::Off);
-    let mut frequency: f32 = 0.0;
-    let mut key_text: String<16> = String::new();
-    core::write!(key_text, "Init...").unwrap();
-    let mut ui_state = synth::UiState {
-        mode: synth::SequencerMode::Stop,
-        step: 0,
-        octave: 2,
-        semitone: 0,
-        fm_index: 0.0,
-        carrier_wave: crate::Waveform::Sine,
-        mod_wave: crate::Waveform::Sine,
-        is_shift_held: false,
-        is_haas_active: false,
-        bpm: 120.0,
-        active_env: synth::ActiveEnv::Amp,
-        active_env_param: synth::EnvParam::Attack,
-    };
-    display.init().unwrap();
-    display.clear(BinaryColor::Off).unwrap();
-    display.flush().unwrap();
-    let mut ticker = embassy_time::Ticker::every(embassy_time::Duration::from_millis(100));
-    loop {
-        let mut last_state_received = None;
-        while let Ok(state) = synth::UI_DASHBOARD_CHANNEL.try_receive() {
-            last_state_received = Some(state);
-        }
-        if let Some(new_state) = last_state_received {
-            ui_state = new_state;
-        }
-        Rectangle::new(Point::new(0, 0), Size::new(128, 64))
-            .into_styled(clear_style)
-            .draw(&mut display)
-            .unwrap();
-        let mut status_text: String<16> = String::new();
-        core::write!(
-            status_text,
-            "OCT: {} ST: {}",
-            ui_state.octave,
-            ui_state.semitone
-        )
-        .unwrap_or(());
-        Text::with_baseline(&status_text, Point::new(0, 10), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-        let mut fm_text: String<16> = String::new();
-        core::write!(fm_text, "IDX: {}", (ui_state.fm_index * 10.0) as i32).unwrap_or(());
-        Text::with_baseline(&fm_text, Point::new(0, 20), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-        let mut wave_text: String<16> = String::new();
-        core::write!(
-            wave_text,
-            "C: {} M: {}",
-            wave_to_short_str(ui_state.carrier_wave),
-            wave_to_short_str(ui_state.mod_wave)
-        )
-        .unwrap_or(());
-        Text::with_baseline(&wave_text, Point::new(0, 30), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-        let mut bpm_text: String<16> = String::new();
-        // 使用 {:.1} 只显示一位小数，确保显示稳定
-        core::write!(bpm_text, "BPM: {:.1}", ui_state.bpm).unwrap_or(());
-        Text::with_baseline(&bpm_text, Point::new(0, 40), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-        match display.flush() {
-            Ok(_) => {}
-            Err(e) => {
-                // 如果 I2C 写入失败，打印错误并继续下一个循环
-                error!("OLED I2C flush error during transition");
-            }
-        }
 
-        ticker.next().await;
-    }
-}
 
 
 const I16_SCALE: f32 = 32767.0;

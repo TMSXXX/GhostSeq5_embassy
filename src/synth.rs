@@ -76,26 +76,10 @@ pub static ENCODER_SWITCH_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = C
 pub static DRUM_CHANNEL: Channel<CriticalSectionRawMutex, DrumSample, 4> = Channel::new();
 pub static POT1_CHANNEL: Channel<CriticalSectionRawMutex, u16, 4> = Channel::new();
 pub static HAAS_STATE_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
-pub static UI_DASHBOARD_CHANNEL: Channel<CriticalSectionRawMutex, UiState, 2> = Channel::new();
 pub static MASTER_DRIVE_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct UiState {
-    pub octave: usize,
-    pub semitone: i8,
-    pub fm_index: f32,
-    pub carrier_wave: Waveform,
-    pub mod_wave: Waveform,
-    pub is_shift_held: bool,
-    pub is_haas_active: bool,
-    pub mode: SequencerMode,
-    pub step: usize,
-    pub bpm: f32,                   // (已集成)
-    pub active_env: ActiveEnv,      // <-- (新!)
-    pub active_env_param: EnvParam, // <-- (新!)
-}
 
-// ... (SequencerMode, NoteData, DrumTracks, StepData, ControlState, EnvelopeStage, Envelope (及 impl) ... 不变) ...
+
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum SequencerMode {
@@ -683,22 +667,6 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
             let _ = AUDIO_CHANNEL.try_send(AudioCommand::Stop);
         }
 
-        // --- 8G. 发送 UI 状态包 (已修改) ---
-        let ui_state = UiState {
-            octave: octave_scale,
-            semitone: semitone_shift,
-            fm_index: max_fm_index,
-            carrier_wave: wave_params.carrier_wave,
-            mod_wave: wave_params.mod_wave,
-            is_shift_held: is_shift_held,
-            is_haas_active: is_haas_active,
-            mode: sequencer_mode,
-            step: current_step,
-            bpm,
-            active_env,       // <-- NEW
-            active_env_param, // <-- NEW
-        };
-        let _ = UI_DASHBOARD_CHANNEL.try_send(ui_state);
 
         // --- 9. Await 5ms ---
         ticker.next().await;
