@@ -319,7 +319,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
     // -----------------------------------------------------------------
     // 8. P7 主循环 (使用 Ticker)
     // -----------------------------------------------------------------
-    let mut ticker = Ticker::every(Duration::from_millis(10));
+    let mut ticker = Ticker::every(Duration::from_millis(20));
 
     loop {
         // --- 8A. 检查所有通道 (已修改) ---

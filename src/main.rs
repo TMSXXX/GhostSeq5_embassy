@@ -1,8 +1,10 @@
 #![no_std]
 #![no_main]
 
+mod dsp;
 mod synth;
 mod wavetable;
+use crate::dsp::cheap_saturator;
 use crate::synth::{
     DRUM_CHANNEL, DrumSample, FM_PARAM_CHANNEL, FmParams, MASTER_DRIVE_CHANNEL, UiState,
 };
@@ -311,14 +313,13 @@ async fn oled_task(mut display: OledDisplay) {
     }
 }
 
-// (在 main.rs 中)
-// 粘贴并替换你现有的 audio_task
 
+const I16_SCALE: f32 = 32767.0;
 #[embassy_executor::task()]
 async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
-    info!("Audio task starting...");
+    info!("Audio task starting (F32 Safe Optimized)...");
 
-    // --- 1. 状态变量 (已回退到 FM) ---
+    // --- 1. 状态变量 (不变) ---
     let mut frequency = 100.0f32;
     let mut is_on = false;
     let mut carrier_phase: f32 = 0.0;
@@ -333,9 +334,6 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         ratio: 2.0,
     };
 
-    // --- (新!) 鼓组复音状态 ---
-    // 我们不再使用 'current_drum' 和 'drum_pos'
-    // 而是为每个鼓维护一个独立的播放位置
     let mut kick_pos: Option<usize> = None;
     let mut snare_pos: Option<usize> = None;
     let mut hat_pos: Option<usize> = None;
@@ -347,10 +345,13 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     let mut haas_write_ptr: usize = 0;
     let mut haas_active: bool = false;
     let mut master_drive = 1.;
+    
     const TABLE_MASK: usize = WAVE_TABLE_SIZE - 1;
     const TABLE_SIZE_F32: f32 = WAVE_TABLE_SIZE as f32;
     const TWO_PI: f32 = 2.0 * PI;
-    const TWO_PI_INV: f32 = 0.15915494;
+    const TWO_PI_INV: f32 = 0.15915494; // 1.0 / (2.0 * PI)
+    const I16_SCALE: f32 = 32767.0; // i16 max value for scaling
+    
     let sine_table = get_sine_table();
     let sawtooth_table = get_sawtooth_table();
     let square_table = get_square_table();
@@ -360,140 +361,164 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     let snare_samples = get_snare_sample_table();
     let hat_samples = get_hat_sample_table();
 
-    // --- 3. fill_buffer (已修改为支持鼓组复音) ---
+    // --- 3. fill_buffer (优化) ---
     let mut fill_buffer = |buffer: &mut [u16; HALF_DMA_LEN],
-                           freq: f32,
-                           p: &FmParams,
-                           wp: &WaveParams,
-                           amp: f32, // 这是 FM 的 amp
-                           cp: &mut f32,
-                           mp: &mut f32,
-                           // (新!) 传入所有鼓的状态
-                           kick_pos: &mut Option<usize>,
-                           snare_pos: &mut Option<usize>,
-                           hat_pos: &mut Option<usize>,
-                           on: bool,
-                           hdl: &mut [i16; HAAS_DELAY_SIZE],
-                           hwp: &mut usize,
-                           haas_on: bool,
-                           master_drive_val: f32| {
+                            freq: f32,
+                            p: &FmParams,
+                            wp: &WaveParams,
+                            amp: f32, // 这是 FM 的 amp
+                            cp: &mut f32,
+                            mp: &mut f32,
+                            kick_pos: &mut Option<usize>,
+                            snare_pos: &mut Option<usize>,
+                            hat_pos: &mut Option<usize>,
+                            on: bool,
+                            hdl: &mut [i16; HAAS_DELAY_SIZE],
+                            hwp: &mut usize,
+                            haas_on: bool,
+                            master_drive_val: f32| {
+
+        // A. 预计算 (Pre-calculation) - 只执行一次
         let carrier_freq = freq;
         let modulator_freq = carrier_freq * p.ratio;
         let carrier_phase_increment = (TWO_PI * carrier_freq) / 48000.0;
         let modulator_phase_increment = (TWO_PI * modulator_freq) / 48000.0;
+        
+        // 分支提升: 将 match 移到循环外部 (保留!)
+        let carrier_lut = match wp.carrier_wave {
+            Waveform::Sine => sine_table,
+            Waveform::Triangle => triangle_table,
+            Waveform::Sawtooth => sawtooth_table,
+            Waveform::Square => square_table,
+        };
+        let mod_lut = match wp.mod_wave {
+            Waveform::Sine => sine_table,
+            Waveform::Triangle => triangle_table,
+            Waveform::Sawtooth => sawtooth_table,
+            Waveform::Square => square_table,
+        };
+        
+        // 增益预计算 (保留!)
+        let fm_total_gain_pre_drive = amp * 0.3;
+        let drum_total_gain_pre_drive = 0.3;
+        
+        let final_scale_factor = if master_drive_val > 0.0001 {
+            5.0 / master_drive_val 
+        } else {
+            5.0 
+        };
 
+        // 缓存可变状态到局部变量 (保留!)
+        let mut local_kick_pos = *kick_pos;
+        let mut local_snare_pos = *snare_pos;
+        let mut local_hat_pos = *hat_pos;
+        let mut local_hwp = *hwp;
+
+        // B. 热循环 (Hot Loop)
         for i in 0..SAMPLES_PER_BUFFER {
-            // --- A. FM 合成 (不变) ---
+            let mut drum_sample_f32 = 0.0;
             let fm_sample_f32 = if on {
-                // (调制波 B)
+                // ... (相位计算不变) ...
                 let mod_phase_rads = *mp;
                 let mod_index_f32 = (mod_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32;
                 let mod_idx0 = (mod_index_f32 as i32) as usize & TABLE_MASK;
 
-                let mod_val = match wp.mod_wave {
-                    Waveform::Sine => sine_table[mod_idx0],
-                    Waveform::Triangle => triangle_table[mod_idx0],
-                    Waveform::Sawtooth => sawtooth_table[mod_idx0],
-                    Waveform::Square => square_table[mod_idx0],
-                };
+                // 优化 1: 恢复安全查找
+                let mod_val = mod_lut[mod_idx0]; // <--- 关键修改
 
                 let phase_offset = mod_val * p.index;
                 let mut carrier_phase_rads = *cp + phase_offset;
-                while carrier_phase_rads < 0.0 {
-                    carrier_phase_rads += TWO_PI;
+                
+                if carrier_phase_rads > TWO_PI {
+                    carrier_phase_rads -= TWO_PI;
                 }
-
-                // (载波 A)
+                
                 let carrier_index_f32 = (carrier_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32;
                 let carrier_idx0 = (carrier_index_f32 as i32) as usize & TABLE_MASK;
-
-                match wp.carrier_wave {
-                    Waveform::Sine => sine_table[carrier_idx0],
-                    Waveform::Triangle => triangle_table[carrier_idx0],
-                    Waveform::Sawtooth => sawtooth_table[carrier_idx0],
-                    Waveform::Square => square_table[carrier_idx0],
-                }
+                
+                // 优化 1: 恢复安全查找
+                carrier_lut[carrier_idx0] // <--- 关键修改
             } else {
                 0.0
             };
 
-            // --- B. 鼓采样 (已修改为复音) ---
-            let mut drum_sample_f32 = 0.0;
-
-            // 1. 处理 Kick
-            if let Some(pos) = kick_pos {
-                if *pos < KICK_SAMPLE_LEN {
-                    drum_sample_f32 += kick_samples[*pos]; // 混合
-                    *kick_pos = Some(*pos + 1); // 推进位置
-                } else {
-                    *kick_pos = None; // 播放完毕
-                }
+            // --- 鼓采样 (恢复安全查找) ---
+            
+            if let Some(pos) = local_kick_pos {
+                if pos < KICK_SAMPLE_LEN {
+                    drum_sample_f32 += kick_samples[pos]; // <--- 关键修改
+                    local_kick_pos = Some(pos + 1);
+                } else { local_kick_pos = None; }
             }
-
-            // 2. 处理 Snare
-            if let Some(pos) = snare_pos {
-                if *pos < SNARE_SAMPLE_LEN {
-                    drum_sample_f32 += snare_samples[*pos]; // 混合
-                    *snare_pos = Some(*pos + 1); // 推进位置
-                } else {
-                    *snare_pos = None; // 播放完毕
-                }
+            if let Some(pos) = local_snare_pos {
+                if pos < SNARE_SAMPLE_LEN {
+                    drum_sample_f32 += snare_samples[pos]; // <--- 关键修改
+                    local_snare_pos = Some(pos + 1);
+                } else { local_snare_pos = None; }
             }
-
-            // 3. 处理 Hat
-            if let Some(pos) = hat_pos {
-                if *pos < HAT_SAMPLE_LEN {
-                    drum_sample_f32 += hat_samples[*pos]; // 混合
-                    *hat_pos = Some(*pos + 1); // 推进位置
-                } else {
-                    *hat_pos = None; // 播放完毕
-                }
+            if let Some(pos) = local_hat_pos {
+                if pos < HAT_SAMPLE_LEN {
+                    drum_sample_f32 += hat_samples[pos]; // <--- 关键修改
+                    local_hat_pos = Some(pos + 1);
+                } else { local_hat_pos = None; }
             }
-            let mixed_sample_f32 = (fm_sample_f32 * amp * 0.3) + (drum_sample_f32 * 0.3); //
+            
+            // 优化 2: 混合和驱动 (保留预计算)
+            let pre_driven_signal = (fm_sample_f32 * fm_total_gain_pre_drive) + 
+                                    (drum_sample_f32 * drum_total_gain_pre_drive);
 
-            // 1. 驱动信号
-            let driven_signal = mixed_sample_f32 * master_drive_val;
+            let driven_signal = pre_driven_signal * master_drive_val;
 
-            // 2. 饱和处理
             let saturated_signal = cheap_saturator(driven_signal);
 
-            let final_sample_f32 = (saturated_signal / master_drive_val) * 5.0;
+            let final_sample_f32 = saturated_signal * final_scale_factor;
 
-            let mono_sample_i16 = (final_sample_f32 * 32767.0) as i16;
+            // 优化 3: 使用常量 I16_SCALE (保留)
+            let mono_sample_i16 = (final_sample_f32 * I16_SCALE) as i16;
 
             // Haas 效果 (不变)
-            let read_ptr = *hwp;
+            let read_ptr = local_hwp;
             let delayed_sample_i16 = hdl[read_ptr];
             hdl[read_ptr] = mono_sample_i16;
-            *hwp += 1;
-            if *hwp >= HAAS_DELAY_SIZE {
-                *hwp = 0;
+            
+            local_hwp += 1;
+            if local_hwp >= HAAS_DELAY_SIZE {
+                local_hwp = 0;
             }
-            if haas_on {
-                buffer[i * 2] = mono_sample_i16 as u16;
-                buffer[i * 2 + 1] = delayed_sample_i16 as u16;
-            } else {
-                buffer[i * 2] = mono_sample_i16 as u16;
-                buffer[i * 2 + 1] = mono_sample_i16 as u16;
-            }
+            let left = mono_sample_i16 as u16;
+            let right = if haas_on { delayed_sample_i16 as u16 } else { left };
 
+            buffer[i * 2] = left;
+            buffer[i * 2 + 1] = right;
+            
             // 相位推进 (不变)
             *cp += carrier_phase_increment;
             *mp += modulator_phase_increment;
-            if *cp > TWO_PI {
-                *cp -= TWO_PI;
-            }
-            if *mp > TWO_PI {
-                *mp -= TWO_PI;
-            }
+            
+            if *cp > TWO_PI { *cp -= TWO_PI; }
+            if *mp > TWO_PI { *mp -= TWO_PI; }
         }
+        
+        // 回写状态 (不变)
+        *kick_pos = local_kick_pos;
+        *snare_pos = local_snare_pos;
+        *hat_pos = local_hat_pos;
+        *hwp = local_hwp;
+
         if !on {
             *cp = 0.0;
             *mp = 0.0;
         }
     }; // (fill_buffer 闭包结束)
 
-    // --- 4. 预填充 (已修改) ---
+    // ... (主循环和预填充逻辑不变) ...
+    // ...
+    // ...
+    // ...
+    
+    // 剩下的主循环逻辑与之前版本相同。
+    
+    // ... (主循环和预填充逻辑不变) ...
     fill_buffer(
         &mut audio_buffers[0],
         frequency,
@@ -502,7 +527,6 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         amplitude,
         &mut carrier_phase,
         &mut modulator_phase,
-        // (新!) 传入鼓状态
         &mut kick_pos,
         &mut snare_pos,
         &mut hat_pos,
@@ -520,7 +544,6 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         amplitude,
         &mut carrier_phase,
         &mut modulator_phase,
-        // (新!) 传入鼓状态
         &mut kick_pos,
         &mut snare_pos,
         &mut hat_pos,
@@ -531,14 +554,11 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         master_drive,
     );
 
-    // --- 5. I2S 启动 (不变) ---
     i2s.start();
     info!("I2S started!");
     let mut write_future = i2s.write(&audio_buffers[current_buffer_idx]);
 
-    // --- 6. Audio Loop ---
     loop {
-        // I2S 错误处理 (不变)
         match write_future.await {
             Ok(_) => {}
             Err(e) => {
@@ -551,18 +571,14 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
                 i2s.clear();
                 haas_delay_line.fill(0);
                 haas_write_ptr = 0;
-
-                // (新!) 重置鼓状态
                 kick_pos = None;
                 snare_pos = None;
                 hat_pos = None;
-
                 write_future = i2s.write(&audio_buffers[current_buffer_idx]);
                 continue;
             }
         }
 
-        // 缓冲区交换 (不变)
         let (buf0_slice, buf1_slice) = audio_buffers.split_at_mut(1);
         let buf0 = &mut buf0_slice[0];
         let buf1 = &mut buf1_slice[0];
@@ -576,49 +592,31 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             buf_to_fill = buf0;
         }
         write_future = i2s.write(buf_to_write);
-        // --- S 关键路径结束 ---
 
-        // --- 非关键路径 ---
+        // --- 非关键路径 (消息接收和填充) ---
+        if let Ok(new_params) = FM_PARAM_CHANNEL.try_receive() { params = new_params; }
+        if let Ok(new_amp) = AMP_CHANNEL.try_receive() { amplitude = new_amp; }
+        if let Ok(haas_on) = synth::HAAS_STATE_CHANNEL.try_receive() { haas_active = haas_on; }
+        if let Ok(new_waves) = WAVE_PARAMS_CHANNEL.try_receive() { wave_params = new_waves; }
+        if let Ok(drive) = MASTER_DRIVE_CHANNEL.try_receive() { master_drive = drive; }
 
-        if let Ok(new_params) = FM_PARAM_CHANNEL.try_receive() {
-            params = new_params;
-        }
-        if let Ok(new_amp) = AMP_CHANNEL.try_receive() {
-            amplitude = new_amp;
-        }
-        if let Ok(haas_on) = synth::HAAS_STATE_CHANNEL.try_receive() {
-            haas_active = haas_on;
-        }
-        if let Ok(new_waves) = WAVE_PARAMS_CHANNEL.try_receive() {
-            wave_params = new_waves;
-        }
-        if let Ok(drive) = MASTER_DRIVE_CHANNEL.try_receive() {
-            master_drive = drive;
-        }
-        // (新!) 处理鼓组触发
         while let Ok(drum) = synth::DRUM_CHANNEL.try_receive() {
-            // 不再是替换，而是独立触发
             match drum {
-                DrumSample::Kick => kick_pos = Some(0), // 从 0 开始播放 Kick
-                DrumSample::Snare => snare_pos = Some(0), // 从 0 开始播放 Snare
-                DrumSample::Hat => hat_pos = Some(0),   // 从 0 开始播放 Hat
+                DrumSample::Kick => kick_pos = Some(0),
+                DrumSample::Snare => snare_pos = Some(0),
+                DrumSample::Hat => hat_pos = Some(0),
             }
         }
-
-        // (AudioCommand 接收... 不变)
         while let Ok(command) = AUDIO_CHANNEL.try_receive() {
             match command {
                 AudioCommand::Play(freq) => {
                     frequency = freq;
                     is_on = true;
                 }
-                AudioCommand::Stop => {
-                    is_on = false;
-                }
+                AudioCommand::Stop => { is_on = false; }
             }
         }
 
-        // (新!) 填充下一个缓冲区
         fill_buffer(
             buf_to_fill,
             frequency,
@@ -627,7 +625,6 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             amplitude,
             &mut carrier_phase,
             &mut modulator_phase,
-            // (新!) 传入鼓状态
             &mut kick_pos,
             &mut snare_pos,
             &mut hat_pos,
@@ -647,8 +644,4 @@ const fn wave_to_short_str(wave: Waveform) -> &'static str {
         Waveform::Sawtooth => "SAW",
         Waveform::Square => "SQU",
     }
-}
-
-fn cheap_saturator(x: f32) -> f32 {
-    x / (1.0 + x.abs())
 }
