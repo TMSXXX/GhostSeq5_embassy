@@ -5,7 +5,10 @@ mod dsp;
 mod synth;
 mod wavetable;
 use crate::dsp::cheap_saturator;
-use crate::synth::{DRUM_CHANNEL, DrumSample, FM_PARAM_CHANNEL, FmParams, MASTER_DRIVE_CHANNEL};
+use crate::synth::{
+    DRUM_CHANNEL, DrumSample, FM_PARAM_CHANNEL, FmParams, MASTER_DRIVE_CHANNEL,
+    REVERSE_STATE_CHANNEL, SAMPLE_PITCH_CHANNEL,
+};
 use crate::wavetable::{
     HAT_SAMPLE_LEN, KICK_SAMPLE_LEN, SNARE_SAMPLE_LEN, WAVE_TABLE_SIZE, WaveParams, Waveform,
     get_hat_sample_table, get_kick_sample_table, get_sawtooth_table, get_sine_table,
@@ -170,7 +173,6 @@ async fn main(spawner: Spawner) {
     let spawner_high = EXECUTOR_HIGH.start(interrupt::TIM2);
     interrupt::TIM3.set_priority(Priority::P4);
 
-
     // 2. 创建一个裸指针 (Raw Pointer)
     let raw_ptr = unsafe { (&raw mut USER_SAMPLE_MEMORY) as *mut i16 };
     let sample_ready_ref = &USER_SAMPLE_READY;
@@ -250,6 +252,7 @@ async fn audio_task(
     let mut carrier_phase: f32 = 0.0;
     let mut modulator_phase: f32 = 0.0;
     let mut amplitude: f32 = 0.0;
+    let mut playback_step: f32 = 0.18;
     let mut wave_params = WaveParams {
         carrier_wave: Waveform::Triangle,
         mod_wave: Waveform::Square,
@@ -258,7 +261,7 @@ async fn audio_task(
         index: 1.5,
         ratio: 2.0,
     };
-
+    let mut is_reverse = false;
     let mut kick_pos: Option<usize> = None;
     let mut snare_pos: Option<usize> = None;
     let mut hat_pos: Option<usize> = None;
@@ -303,7 +306,9 @@ async fn audio_task(
                            hdl: &mut [i16; HAAS_DELAY_SIZE],
                            hwp: &mut usize,
                            haas_on: bool,
-                           master_drive_val: f32| {
+                           master_drive_val: f32,
+                           is_reverse_val: bool,
+                           playback_step_val: f32| {
         // A. 预计算 (Pre-calculation) - 只执行一次
         let carrier_freq = freq;
         let modulator_freq = carrier_freq * p.ratio;
@@ -397,18 +402,21 @@ async fn audio_task(
             if let Some(pos) = *sample_slot_pos {
                 let sample_len = sample_ready_ref.load(Ordering::SeqCst);
 
-                // 将浮点位置转为整数索引进行读取
-                let idx = pos as usize;
+                // 使用参数 is_reverse_val 来判断
+                let read_idx_f32 = if is_reverse_val {
+                    (sample_len as f32) - 1.0 - pos
+                } else {
+                    pos
+                };
 
-                if idx < sample_len {
-                    // 读取数据
+                // 防止索引越界 (虽然 pos < len 保护了，但 float 计算可能有误差，安全第一)
+                let idx = read_idx_f32.max(0.0) as usize;
+
+                if idx < sample_len && pos < (sample_len as f32) {
+                    // 读取
                     drum_sample_f32 += sample_buffer[idx] as f32 / 32768.0;
-
-                    // --- 关键修改：慢速步进 ---
-                    // 系统是 48kHz，录音是 12kHz。比例是 1:4。
-                    // 所以每过一个系统采样点，播放指针只走 0.25 步。
-                    // 这样播放速度就降低了 4 倍，音高就正常了！
-                    *sample_slot_pos = Some(pos + 0.18);
+                    // 步进 (始终向前走)
+                    *sample_slot_pos = Some(pos + playback_step_val);
                 } else {
                     *sample_slot_pos = None;
                 }
@@ -486,6 +494,8 @@ async fn audio_task(
         &mut haas_write_ptr,
         haas_active,
         master_drive,
+        is_reverse,
+        playback_step,
     );
     fill_buffer(
         &mut audio_buffers[1],
@@ -504,6 +514,8 @@ async fn audio_task(
         &mut haas_write_ptr,
         haas_active,
         master_drive,
+        is_reverse,
+        playback_step,
     );
 
     i2s.start();
@@ -511,6 +523,9 @@ async fn audio_task(
     let mut write_future = i2s.write(&audio_buffers[current_buffer_idx]);
 
     loop {
+        if let Ok(rev) = REVERSE_STATE_CHANNEL.try_receive() {
+            is_reverse = rev;
+        }
         match write_future.await {
             Ok(_) => {}
             Err(e) => {
@@ -561,6 +576,9 @@ async fn audio_task(
         if let Ok(drive) = MASTER_DRIVE_CHANNEL.try_receive() {
             master_drive = drive;
         }
+        if let Ok(speed) = SAMPLE_PITCH_CHANNEL.try_receive() {
+            playback_step = speed;
+        }
 
         while let Ok(drum) = synth::DRUM_CHANNEL.try_receive() {
             match drum {
@@ -599,6 +617,8 @@ async fn audio_task(
             &mut haas_write_ptr,
             haas_active,
             master_drive,
+            is_reverse,
+            playback_step,
         );
     }
 }
