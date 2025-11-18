@@ -5,9 +5,7 @@ mod dsp;
 mod synth;
 mod wavetable;
 use crate::dsp::cheap_saturator;
-use crate::synth::{
-    DRUM_CHANNEL, DrumSample, FM_PARAM_CHANNEL, FmParams, MASTER_DRIVE_CHANNEL,
-};
+use crate::synth::{DRUM_CHANNEL, DrumSample, FM_PARAM_CHANNEL, FmParams, MASTER_DRIVE_CHANNEL};
 use crate::wavetable::{
     HAT_SAMPLE_LEN, KICK_SAMPLE_LEN, SNARE_SAMPLE_LEN, WAVE_TABLE_SIZE, WaveParams, Waveform,
     get_hat_sample_table, get_kick_sample_table, get_sawtooth_table, get_sine_table,
@@ -27,11 +25,13 @@ use embassy_stm32::{
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::Timer;
+use once_cell::sync::OnceCell;
 use static_cell::StaticCell;
 
 use {defmt_rtt as _, panic_probe as _};
 
 use core::f32::consts::PI;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 const AUDIO_DMA_BUF_SIZE: usize = 2400;
 static DMA_BUF_CELL: StaticCell<[u16; AUDIO_DMA_BUF_SIZE]> = StaticCell::new();
@@ -42,7 +42,14 @@ const HAAS_DELAY_MS: usize = 20;
 const HAAS_DELAY_SIZE: usize = (48000 * HAAS_DELAY_MS) / 1000; // 960
 static HAAS_DELAY_LINE: StaticCell<[i16; HAAS_DELAY_SIZE]> = StaticCell::new();
 
-// ... (Enums, Structs ... 已回退) ...
+pub const USER_SAMPLE_LEN: usize = 24000;
+
+// --- (修改) 使用 static mut 直接分配内存 ---
+// 这种方式由链接器直接在 RAM 中保留空间，启动时自动清零，不占用栈
+static mut USER_SAMPLE_MEMORY: [i16; USER_SAMPLE_LEN] = [0; USER_SAMPLE_LEN];
+// 2. 使用 AtomicUsize 存储长度（用于安全共享）
+static USER_SAMPLE_READY: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Debug, Clone, Copy)]
 enum Keyboard {
     KeyPress(u8),
@@ -57,6 +64,8 @@ enum AudioCommand {
 static AUDIO_CHANNEL: Channel<CriticalSectionRawMutex, AudioCommand, 4> = Channel::new();
 static AMP_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
 static WAVE_PARAMS_CHANNEL: Channel<CriticalSectionRawMutex, WaveParams, 4> = Channel::new();
+// 控制录音：true=开始录音，false=停止录音/等待
+static RECORD_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
 
 // ... (Executors, Interrupts, main() ... 不变) ...
 static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
@@ -82,7 +91,6 @@ async fn main(spawner: Spawner) {
         let scb = SCB::ptr();
         (*scb).shpr[11].write(Priority::P6.into());
     }
-    enable_fpu();
     let config = {
         //
         use embassy_stm32::rcc::*;
@@ -115,6 +123,7 @@ async fn main(spawner: Spawner) {
     };
     let p = embassy_stm32::init(config);
 
+    enable_fpu();
     interrupt::TIM5.set_priority(Priority::P4);
 
     // 2. 启动 P4 执行器
@@ -127,7 +136,7 @@ async fn main(spawner: Spawner) {
     ];
     info!("Keyboard pins configured.");
     let mut adc = Adc::new(p.ADC1);
-    adc.set_sample_time(SampleTime::CYCLES15);
+    adc.set_sample_time(SampleTime::CYCLES480);
     let mut i2s_config = i2s::Config::default();
     i2s_config.format = i2s::Format::Data16Channel32;
     i2s_config.master_clock = false;
@@ -155,21 +164,52 @@ async fn main(spawner: Spawner) {
     get_square_table();
     get_triangle_table();
     get_kick_sample_table();
+    get_snare_sample_table();
+    get_hat_sample_table();
     interrupt::TIM2.set_priority(Priority::P3);
     let spawner_high = EXECUTOR_HIGH.start(interrupt::TIM2);
     interrupt::TIM3.set_priority(Priority::P4);
+
+
+    // 2. 创建一个裸指针 (Raw Pointer)
+    let raw_ptr = unsafe { (&raw mut USER_SAMPLE_MEMORY) as *mut i16 };
+    let sample_ready_ref = &USER_SAMPLE_READY;
+
+    // 2. (Unsafe) 从同一个原始指针重建两个切片
+    // buffer_for_record: 可变引用，给录音任务用
+    let buffer_for_record = unsafe { core::slice::from_raw_parts_mut(raw_ptr, USER_SAMPLE_LEN) };
+
+    // buffer_for_audio: 不可变引用，给播放任务用
+    // (注意：在 Rust 规则中这仍是不安全的，但我们在逻辑上保证了录音和播放互斥)
+    let buffer_for_audio = unsafe { core::slice::from_raw_parts(raw_ptr, USER_SAMPLE_LEN) };
     //let spawner_med = EXECUTOR_MED.start(interrupt::TIM3);
     //interrupt::TIM5.set_priority(Priority::P15);
     //let spawner_low = EXECUTOR_LOW.start(interrupt::TIM5);
 
     // (Spawners 不变, audio_task 已恢复)
     //spawner.spawn(oled_task(display)).unwrap();
-    spawner_high.spawn(synth::adc_task(adc, p.PB0)).unwrap();
+
     spawner_high.spawn(synth::control_task(keys, led)).unwrap();
     spawner_high
         .spawn(synth::encoder_task(enc_a, enc_b, enc_sw))
         .unwrap();
-    spawner_high.spawn(audio_task(i2s)).unwrap();
+    spawner_high
+        .spawn(audio_task(
+            i2s,
+            buffer_for_audio, // <-- (新!) 传递只读引用
+            sample_ready_ref,
+        ))
+        .unwrap();
+
+    spawner_high
+        .spawn(synth::record_task(
+            adc,
+            p.PB0,
+            p.PB1,
+            buffer_for_record, // <-- (新!) 传递可变引用
+            sample_ready_ref,
+        ))
+        .unwrap();
 
     info!("All tasks started, system ready!");
 }
@@ -178,7 +218,17 @@ async fn main(spawner: Spawner) {
 fn enable_fpu() {
     unsafe {
         let scb = cortex_m::peripheral::SCB::ptr();
+
+        // 1. 启用 FPU 访问 (CP10 和 CP11)
+        // (这部分你已经有了)
         (*scb).cpacr.modify(|r| r | (0b1111 << 20));
+
+        // 2. 启用自动和懒惰状态保存 (关键修复)
+        //    设置 FPCCR 寄存器的 ASPEN (bit 31) 和 LSPEN (bit 30)
+        //    这告诉处理器在异常 (中断) 期间自动处理 FPU 上下文
+        let fpccr = 0xE000EF34 as *mut u32;
+        *fpccr = *fpccr | (1 << 31) | (1 << 30);
+
         cortex_m::asm::dsb();
         cortex_m::asm::isb();
     }
@@ -186,11 +236,12 @@ fn enable_fpu() {
 
 // (oled_task 不变)
 
-
-
-const I16_SCALE: f32 = 32767.0;
 #[embassy_executor::task()]
-async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
+async fn audio_task(
+    mut i2s: i2s::I2S<'static, u16>,
+    sample_buffer: &'static [i16], // <-- (新!) 接收缓冲区只读引用
+    sample_ready_ref: &'static AtomicUsize, // <-- (新!) 接收长度计数器引用
+) {
     info!("Audio task starting (F32 Safe Optimized)...");
 
     // --- 1. 状态变量 (不变) ---
@@ -211,6 +262,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     let mut kick_pos: Option<usize> = None;
     let mut snare_pos: Option<usize> = None;
     let mut hat_pos: Option<usize> = None;
+    let mut sample_slot_pos: Option<f32> = None;
 
     // --- 2. 缓冲区, Haas, 常量, 波表 (不变) ---
     let audio_buffers = AUDIO_BUFFERS.init([[0u16; HALF_DMA_LEN]; 2]);
@@ -219,13 +271,13 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
     let mut haas_write_ptr: usize = 0;
     let mut haas_active: bool = false;
     let mut master_drive = 1.;
-    
+
     const TABLE_MASK: usize = WAVE_TABLE_SIZE - 1;
     const TABLE_SIZE_F32: f32 = WAVE_TABLE_SIZE as f32;
     const TWO_PI: f32 = 2.0 * PI;
     const TWO_PI_INV: f32 = 0.15915494; // 1.0 / (2.0 * PI)
     const I16_SCALE: f32 = 32767.0; // i16 max value for scaling
-    
+
     let sine_table = get_sine_table();
     let sawtooth_table = get_sawtooth_table();
     let square_table = get_square_table();
@@ -237,27 +289,27 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
 
     // --- 3. fill_buffer (优化) ---
     let mut fill_buffer = |buffer: &mut [u16; HALF_DMA_LEN],
-                            freq: f32,
-                            p: &FmParams,
-                            wp: &WaveParams,
-                            amp: f32, // 这是 FM 的 amp
-                            cp: &mut f32,
-                            mp: &mut f32,
-                            kick_pos: &mut Option<usize>,
-                            snare_pos: &mut Option<usize>,
-                            hat_pos: &mut Option<usize>,
-                            on: bool,
-                            hdl: &mut [i16; HAAS_DELAY_SIZE],
-                            hwp: &mut usize,
-                            haas_on: bool,
-                            master_drive_val: f32| {
-
+                           freq: f32,
+                           p: &FmParams,
+                           wp: &WaveParams,
+                           amp: f32, // 这是 FM 的 amp
+                           cp: &mut f32,
+                           mp: &mut f32,
+                           kick_pos: &mut Option<usize>,
+                           snare_pos: &mut Option<usize>,
+                           hat_pos: &mut Option<usize>,
+                           sample_slot_pos: &mut Option<f32>,
+                           on: bool,
+                           hdl: &mut [i16; HAAS_DELAY_SIZE],
+                           hwp: &mut usize,
+                           haas_on: bool,
+                           master_drive_val: f32| {
         // A. 预计算 (Pre-calculation) - 只执行一次
         let carrier_freq = freq;
         let modulator_freq = carrier_freq * p.ratio;
         let carrier_phase_increment = (TWO_PI * carrier_freq) / 48000.0;
         let modulator_phase_increment = (TWO_PI * modulator_freq) / 48000.0;
-        
+
         // 分支提升: 将 match 移到循环外部 (保留!)
         let carrier_lut = match wp.carrier_wave {
             Waveform::Sine => sine_table,
@@ -271,15 +323,15 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             Waveform::Sawtooth => sawtooth_table,
             Waveform::Square => square_table,
         };
-        
+
         // 增益预计算 (保留!)
         let fm_total_gain_pre_drive = amp * 0.3;
         let drum_total_gain_pre_drive = 0.3;
-        
+
         let final_scale_factor = if master_drive_val > 0.0001 {
-            5.0 / master_drive_val 
+            5.0 / master_drive_val
         } else {
-            5.0 
+            5.0
         };
 
         // 缓存可变状态到局部变量 (保留!)
@@ -302,14 +354,14 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
 
                 let phase_offset = mod_val * p.index;
                 let mut carrier_phase_rads = *cp + phase_offset;
-                
+
                 if carrier_phase_rads > TWO_PI {
                     carrier_phase_rads -= TWO_PI;
                 }
-                
+
                 let carrier_index_f32 = (carrier_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32;
                 let carrier_idx0 = (carrier_index_f32 as i32) as usize & TABLE_MASK;
-                
+
                 // 优化 1: 恢复安全查找
                 carrier_lut[carrier_idx0] // <--- 关键修改
             } else {
@@ -317,29 +369,54 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             };
 
             // --- 鼓采样 (恢复安全查找) ---
-            
+
             if let Some(pos) = local_kick_pos {
                 if pos < KICK_SAMPLE_LEN {
                     drum_sample_f32 += kick_samples[pos]; // <--- 关键修改
                     local_kick_pos = Some(pos + 1);
-                } else { local_kick_pos = None; }
+                } else {
+                    local_kick_pos = None;
+                }
             }
             if let Some(pos) = local_snare_pos {
                 if pos < SNARE_SAMPLE_LEN {
                     drum_sample_f32 += snare_samples[pos]; // <--- 关键修改
                     local_snare_pos = Some(pos + 1);
-                } else { local_snare_pos = None; }
+                } else {
+                    local_snare_pos = None;
+                }
             }
             if let Some(pos) = local_hat_pos {
                 if pos < HAT_SAMPLE_LEN {
                     drum_sample_f32 += hat_samples[pos]; // <--- 关键修改
                     local_hat_pos = Some(pos + 1);
-                } else { local_hat_pos = None; }
+                } else {
+                    local_hat_pos = None;
+                }
             }
-            
+            if let Some(pos) = *sample_slot_pos {
+                let sample_len = sample_ready_ref.load(Ordering::SeqCst);
+
+                // 将浮点位置转为整数索引进行读取
+                let idx = pos as usize;
+
+                if idx < sample_len {
+                    // 读取数据
+                    drum_sample_f32 += sample_buffer[idx] as f32 / 32768.0;
+
+                    // --- 关键修改：慢速步进 ---
+                    // 系统是 48kHz，录音是 12kHz。比例是 1:4。
+                    // 所以每过一个系统采样点，播放指针只走 0.25 步。
+                    // 这样播放速度就降低了 4 倍，音高就正常了！
+                    *sample_slot_pos = Some(pos + 0.18);
+                } else {
+                    *sample_slot_pos = None;
+                }
+            }
+
             // 优化 2: 混合和驱动 (保留预计算)
-            let pre_driven_signal = (fm_sample_f32 * fm_total_gain_pre_drive) + 
-                                    (drum_sample_f32 * drum_total_gain_pre_drive);
+            let pre_driven_signal = (fm_sample_f32 * fm_total_gain_pre_drive)
+                + (drum_sample_f32 * drum_total_gain_pre_drive);
 
             let driven_signal = pre_driven_signal * master_drive_val;
 
@@ -354,25 +431,33 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             let read_ptr = local_hwp;
             let delayed_sample_i16 = hdl[read_ptr];
             hdl[read_ptr] = mono_sample_i16;
-            
+
             local_hwp += 1;
             if local_hwp >= HAAS_DELAY_SIZE {
                 local_hwp = 0;
             }
             let left = mono_sample_i16 as u16;
-            let right = if haas_on { delayed_sample_i16 as u16 } else { left };
+            let right = if haas_on {
+                delayed_sample_i16 as u16
+            } else {
+                left
+            };
 
             buffer[i * 2] = left;
             buffer[i * 2 + 1] = right;
-            
+
             // 相位推进 (不变)
             *cp += carrier_phase_increment;
             *mp += modulator_phase_increment;
-            
-            if *cp > TWO_PI { *cp -= TWO_PI; }
-            if *mp > TWO_PI { *mp -= TWO_PI; }
+
+            if *cp > TWO_PI {
+                *cp -= TWO_PI;
+            }
+            if *mp > TWO_PI {
+                *mp -= TWO_PI;
+            }
         }
-        
+
         // 回写状态 (不变)
         *kick_pos = local_kick_pos;
         *snare_pos = local_snare_pos;
@@ -384,15 +469,6 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             *mp = 0.0;
         }
     }; // (fill_buffer 闭包结束)
-
-    // ... (主循环和预填充逻辑不变) ...
-    // ...
-    // ...
-    // ...
-    
-    // 剩下的主循环逻辑与之前版本相同。
-    
-    // ... (主循环和预填充逻辑不变) ...
     fill_buffer(
         &mut audio_buffers[0],
         frequency,
@@ -404,6 +480,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         &mut kick_pos,
         &mut snare_pos,
         &mut hat_pos,
+        &mut sample_slot_pos,
         is_on,
         haas_delay_line,
         &mut haas_write_ptr,
@@ -421,6 +498,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         &mut kick_pos,
         &mut snare_pos,
         &mut hat_pos,
+        &mut sample_slot_pos,
         is_on,
         haas_delay_line,
         &mut haas_write_ptr,
@@ -468,17 +546,28 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
         write_future = i2s.write(buf_to_write);
 
         // --- 非关键路径 (消息接收和填充) ---
-        if let Ok(new_params) = FM_PARAM_CHANNEL.try_receive() { params = new_params; }
-        if let Ok(new_amp) = AMP_CHANNEL.try_receive() { amplitude = new_amp; }
-        if let Ok(haas_on) = synth::HAAS_STATE_CHANNEL.try_receive() { haas_active = haas_on; }
-        if let Ok(new_waves) = WAVE_PARAMS_CHANNEL.try_receive() { wave_params = new_waves; }
-        if let Ok(drive) = MASTER_DRIVE_CHANNEL.try_receive() { master_drive = drive; }
+        if let Ok(new_params) = FM_PARAM_CHANNEL.try_receive() {
+            params = new_params;
+        }
+        if let Ok(new_amp) = AMP_CHANNEL.try_receive() {
+            amplitude = new_amp;
+        }
+        if let Ok(haas_on) = synth::HAAS_STATE_CHANNEL.try_receive() {
+            haas_active = haas_on;
+        }
+        if let Ok(new_waves) = WAVE_PARAMS_CHANNEL.try_receive() {
+            wave_params = new_waves;
+        }
+        if let Ok(drive) = MASTER_DRIVE_CHANNEL.try_receive() {
+            master_drive = drive;
+        }
 
         while let Ok(drum) = synth::DRUM_CHANNEL.try_receive() {
             match drum {
                 DrumSample::Kick => kick_pos = Some(0),
                 DrumSample::Snare => snare_pos = Some(0),
                 DrumSample::Hat => hat_pos = Some(0),
+                DrumSample::User => sample_slot_pos = Some(0.),
             }
         }
         while let Ok(command) = AUDIO_CHANNEL.try_receive() {
@@ -487,7 +576,9 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
                     frequency = freq;
                     is_on = true;
                 }
-                AudioCommand::Stop => { is_on = false; }
+                AudioCommand::Stop => {
+                    is_on = false;
+                }
             }
         }
 
@@ -502,6 +593,7 @@ async fn audio_task(mut i2s: i2s::I2S<'static, u16>) {
             &mut kick_pos,
             &mut snare_pos,
             &mut hat_pos,
+            &mut sample_slot_pos,
             is_on,
             haas_delay_line,
             &mut haas_write_ptr,

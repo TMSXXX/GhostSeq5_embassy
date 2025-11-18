@@ -4,5 +4,14 @@ runner = "probe-rs run --chip stm32f411ceux"
 [build]
 target = "thumbv7em-none-eabihf"
 
+[target.thumbv7em-none-eabihf]
+# 启用硬件FPU和优化
+rustflags = [
+    "-C", "target-feature=+vfp4",      # 启用VFPv4 FPU
+    "-C", "target-cpu=cortex-m4",      # 指定CPU类型
+    "-C", "opt-level=z",               # 代码大小优化
+]
+
+
 [env]
 DEFMT_LOG = "trace"

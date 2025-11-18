@@ -2,6 +2,7 @@
 
 use core::f32::consts::PI;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use defmt::info;
 use embassy_executor::task;
 use embassy_futures::select::{Either, select};
@@ -10,7 +11,7 @@ use embassy_stm32::adc::Adc;
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::gpio::Pin;
 use embassy_stm32::gpio::{AnyPin, Input, Level, Output, Pull, Speed};
-use embassy_stm32::peripherals::{ADC1, PB0};
+use embassy_stm32::peripherals::{ADC1, PB0, PB1};
 use embassy_stm32::peripherals::{PA8, PA9, PA10};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::{Duration, Instant, Ticker, Timer};
@@ -21,7 +22,10 @@ use crate::wavetable::{
     WAVE_TABLE_SIZE, WaveParams, Waveform, get_sawtooth_table, get_sine_table, get_square_table,
     get_triangle_table,
 };
-use crate::{AMP_CHANNEL, AUDIO_CHANNEL, AudioCommand, WAVE_PARAMS_CHANNEL};
+use crate::{
+    AMP_CHANNEL, AUDIO_CHANNEL, AudioCommand, RECORD_COMMAND_CHANNEL, USER_SAMPLE_LEN,
+    USER_SAMPLE_READY, WAVE_PARAMS_CHANNEL,
+};
 
 // --- (新!) FM 合成器的参数 ---
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -35,6 +39,7 @@ pub enum DrumSample {
     Kick,
     Snare,
     Hat,
+    User,
 }
 
 // --- (新!) ADSR 控制状态定义 ---
@@ -77,9 +82,8 @@ pub static DRUM_CHANNEL: Channel<CriticalSectionRawMutex, DrumSample, 4> = Chann
 pub static POT1_CHANNEL: Channel<CriticalSectionRawMutex, u16, 4> = Channel::new();
 pub static HAAS_STATE_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
 pub static MASTER_DRIVE_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
-
-
-
+pub static REVERSE_STATE_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
+pub static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum SequencerMode {
@@ -100,7 +104,7 @@ struct DrumTracks {
     kick: bool,
     snare: bool,
     hat: bool,
-    // (未来我们可以添加 fx: bool)
+    sample: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -271,23 +275,27 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
     let mut step_duration = Duration::from_millis(125);
     let mut last_tick_time = Instant::now();
     let mut sequence: [Option<StepData>; 32] = [None; 32];
+    static mut IS_REVERSE: bool = false;
 
     // --- 7. 功能键 ID (不变) ---
     const CARRIER_WAVE_ID: u8 = 0;
     const MOD_WAVE_ID: u8 = 1;
     const HAAS_TOGGLE_ID: u8 = 3; // (改为 Key 3)
+    const RECORD_START_ID: u8 = 11; // Key 11: 启动/停止录音
 
     const A_PARAM_ID: u8 = 4; // (Key 4)
     const D_PARAM_ID: u8 = 5; // (Key 5)
     const S_PARAM_ID: u8 = 6; // (Key 6)
     const R_PARAM_ID: u8 = 7; // (Key 7)
     const MASTER_DRIVE_ID: u8 = 8;
+    const REVERSE_TOGGLE_ID: u8 = 9;
 
     const ENV_TOGGLE_ID: u8 = 2; // (Key 2)
 
     const KICK_DRUM_ID: u8 = 0;
     const SNARE_DRUM_ID: u8 = 1;
     const HAT_DRUM_ID: u8 = 2;
+    const USER_ID: u8 = 3;
 
     const DSP_MODE_ID: u8 = 12;
     const DRUM_MODE_ID: u8 = 13;
@@ -545,6 +553,36 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
                                     }
                                     let _ = DRUM_CHANNEL.try_send(DrumSample::Hat);
                                 }
+                                USER_ID => {
+                                    let sample_len =
+                                        crate::USER_SAMPLE_READY.load(Ordering::SeqCst);
+
+                                    if sample_len > 0 {
+                                        // 2. 如果在录音模式，将触发写入步进
+                                        if sequencer_mode == SequencerMode::Record {
+                                            // 使用 target_step (如果你实现了量化) 或 current_step
+                                            // 这里假设你用了 target_step 变量
+                                            let step = sequence[current_step]
+                                                .get_or_insert_with(StepData::default);
+
+                                            step.drums.sample = true; // <-- 标记这一步播放采样
+                                        }
+
+                                        // 3. 实时触发 (让你听到你按下的声音)
+                                        let _ = DRUM_CHANNEL.try_send(DrumSample::User);
+                                    }
+                                }
+                                RECORD_START_ID => {
+                                    let is_currently_recording =
+                                        IS_RECORDING.load(Ordering::SeqCst);
+
+                                    // 切换状态
+                                    let new_state = !is_currently_recording;
+                                    IS_RECORDING.store(new_state, Ordering::SeqCst);
+
+                                    // 发送命令给 record_task (True=Start, False=Stop)
+                                    let _ = RECORD_COMMAND_CHANNEL.try_send(new_state);
+                                }
                                 _ => {}
                             },
 
@@ -581,11 +619,19 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
                                     is_haas_active = !is_haas_active;
                                     let _ = HAAS_STATE_CHANNEL.try_send(is_haas_active);
                                 }
+                                REVERSE_TOGGLE_ID => {
+                                    unsafe {
+                                        IS_REVERSE = !IS_REVERSE;
+                                        let _ = REVERSE_STATE_CHANNEL.try_send(IS_REVERSE);
+                                        // (可选) 如果有 LED，这里可以切换 LED 状态
+                                    }
+                                }
                                 A_PARAM_ID => active_env_param = EnvParam::Attack, // Key 4
                                 D_PARAM_ID => active_env_param = EnvParam::Decay,  // Key 5
                                 S_PARAM_ID => active_env_param = EnvParam::Sustain, // Key 6
                                 R_PARAM_ID => active_env_param = EnvParam::Release, // Key 7
                                 MASTER_DRIVE_ID => active_env_param = EnvParam::MasterDrive,
+
                                 _ => {}
                             },
                             _ => {}
@@ -645,6 +691,9 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
                 if step_data.drums.hat {
                     let _ = DRUM_CHANNEL.try_send(DrumSample::Hat);
                 }
+                if step_data.drums.sample {
+                    let _ = DRUM_CHANNEL.try_send(DrumSample::User);
+                }
             } else if note_keys_pressed == 0 {
                 // (这一步是 None，完全是空的)
                 amp_envelope.note_off(); //
@@ -667,21 +716,20 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
             let _ = AUDIO_CHANNEL.try_send(AudioCommand::Stop);
         }
 
-
         // --- 9. Await 5ms ---
         ticker.next().await;
     }
 }
 
-#[task]
-pub async fn adc_task(mut adc: Adc<'static, ADC1>, mut pin: Peri<'static, PB0>) {
-    info!("ADC task (P15) started!");
-    loop {
-        let value = adc.blocking_read(&mut pin);
-        let _ = POT1_CHANNEL.try_send(value);
-        Timer::after_millis(20).await;
-    }
-}
+// #[task]
+// pub async fn adc_task(mut adc: Adc<'static, ADC1>, mut pin: Peri<'static, PB0>) {
+//     info!("ADC task (P15) started!");
+//     loop {
+//         let value = adc.blocking_read(&mut pin);
+//         let _ = POT1_CHANNEL.try_send(value);
+//         Timer::after_millis(20).await;
+//     }
+// }
 
 // (encoder_task 已修复)
 #[task]
@@ -699,15 +747,15 @@ pub async fn encoder_task(
     const DEBOUNCE_TICKS: u8 = 4; // 4 * 5ms = 20ms
 
     // 编码器状态跟踪
-    let mut last_state = 0u8; 
+    let mut last_state = 0u8;
     let clk_init = clk_a.is_high() as u8;
     let dt_init = dt_b.is_high() as u8;
     last_state = (dt_init << 1) | clk_init; // DT (bit 1) | CLK (bit 0)
-    
+
     // --- (新!) 旋转锁定状态 ---
     // 0: 等待变化; 1, 2, 3: 步进中; 4: 锁定/完成
-    let mut rotation_lock_counter: u8 = 0; 
-    
+    let mut rotation_lock_counter: u8 = 0;
+
     // (删除 Rotary Cooldown，因为我们使用状态锁定代替)
 
     loop {
@@ -727,8 +775,8 @@ pub async fn encoder_task(
 
                 // 2. 判断方向 (使用状态序列对比)
                 let direction = match (last_state, curr_state) {
-                    (0b00, 0b01) | (0b01, 0b11) | (0b11, 0b10) | (0b10, 0b00) => -1,  // 逆时针
-                    (0b00, 0b10) | (0b10, 0b11) | (0b11, 0b01) | (0b01, 0b00) => 1, // 顺时针
+                    (0b00, 0b01) | (0b01, 0b11) | (0b11, 0b10) | (0b10, 0b00) => -1, // 逆时针
+                    (0b00, 0b10) | (0b10, 0b11) | (0b11, 0b01) | (0b01, 0b00) => 1,  // 顺时针
                     _ => 0, // 无效状态（抖动或快速变化）
                 };
 
@@ -736,7 +784,7 @@ pub async fn encoder_task(
                 if direction != 0 {
                     // 如果是有效步进，增加计数器
                     rotation_lock_counter += 1;
-                    
+
                     // 只有当计数器达到 4 (完成一个完整四步) 时，才发送输出并重置
                     if rotation_lock_counter == 4 {
                         let _ = ENCODER_ROTARY_CHANNEL.try_send(direction);
@@ -777,6 +825,72 @@ pub async fn encoder_task(
                     sw_last_reading = sw_curr_reading;
                 }
             },
+        }
+    }
+}
+
+#[embassy_executor::task]
+pub async fn record_task(
+    mut adc: Adc<'static, ADC1>,
+    mut pot_pin: Peri<'static, PB0>, // PB0: 电位器读取
+    mut mic_pin: Peri<'static, PB1>, // PB1: 麦克风录音
+    sample_buffer: &'static mut [i16],
+    sample_ready_len: &'static AtomicUsize,
+) {
+    let max_len = sample_buffer.len();
+    // 为电位器创建一个 20ms 的定时器
+    let mut pot_ticker = Ticker::every(Duration::from_millis(20));
+
+    loop {
+        // --- 1. 等待: "录音命令" 或 "电位器定时器" ---
+        match select(RECORD_COMMAND_CHANNEL.receive(), pot_ticker.next()).await {
+            // --- 1A. 收到了录音命令 (START) ---
+            Either::First(command) => {
+                if command == true {
+                    info!("Recording started...");
+                    Timer::after_millis(200).await;
+                    let _ = adc.blocking_read(&mut mic_pin);
+                    Timer::after_micros(10).await;
+
+                    let mut current_pos = 0;
+
+                    while current_pos < max_len {
+                        // 检查是否收到停止命令
+                        if let Ok(false) = RECORD_COMMAND_CHANNEL.try_receive() {
+                            info!("Recording stopped by command.");
+                            break;
+                        }
+
+                        let raw_sample: u16 = adc.blocking_read(&mut mic_pin);
+
+                        let centered = raw_sample as i32 - 2050;
+
+                        let amplified = centered * 1;
+
+                        // 3. 软削波 (防止溢出 i16 范围)
+                        let final_sample = amplified.clamp(-32768, 32767) as i16;
+
+                        // 4. 写入缓冲区
+                        sample_buffer[current_pos] = final_sample;
+
+                        current_pos += 1;
+                        // 保持采样率 (约 10kHz)
+                        Timer::after_micros(80).await;
+                    }
+
+                    // 录音结束，更新长度
+                    sample_ready_len.store(current_pos, Ordering::SeqCst);
+                    info!("Recording finished. Samples: {}", current_pos);
+                }
+            }
+
+            // --- 1B. 电位器定时器触发 (平时状态) ---
+            Either::Second(_) => {
+                // 只有在不录音的时候，才读取电位器
+                let pot_value: u16 = adc.blocking_read(&mut pot_pin);
+                // 尝试发送，如果满了就丢弃，防止阻塞
+                let _ = POT1_CHANNEL.try_send(pot_value);
+            }
         }
     }
 }
