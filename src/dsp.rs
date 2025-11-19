@@ -3,7 +3,20 @@ use micromath::F32Ext;
 // --- 浮点辅助 (用于波表生成的初始化阶段) ---
 
 pub fn cheap_saturator(x: f32) -> f32 {
-    x / (1.0 + x.abs())
+    // 1. 限制输入范围 [防止 x^3 运算时浮点溢出]
+    // 限制在 [-1.5, 1.5] 是一个安全的范围，保证曲线平滑
+    let input_clamped = x.clamp(-1.5, 1.5); 
+
+    // 2. 软削波运算 (无除法，只有乘法)
+    let x2 = input_clamped * input_clamped;
+    let x3 = x2 * input_clamped;
+    
+    // 3. 应用公式: x - x^3 * (1/3)
+    let output = input_clamped - x3 * 0.33333334;
+    
+    // 4. 最终输出硬限制，确保在 [-1.0, 1.0] 内
+    // (这防止了 Cubic Clipper 在极端输入时略微超出 1.0)
+    output.clamp(-1.0, 1.0)
 }
 
 // --- 定点数/整数 DSP 工具 (用于实时 Audio Loop) ---

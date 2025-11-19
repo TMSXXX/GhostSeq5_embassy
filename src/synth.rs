@@ -51,6 +51,7 @@ pub enum EnvParam {
     Sustain,
     Release,
     MasterDrive,
+    Bitcrusher,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -82,6 +83,7 @@ pub static DRUM_CHANNEL: Channel<CriticalSectionRawMutex, DrumSample, 4> = Chann
 pub static POT1_CHANNEL: Channel<CriticalSectionRawMutex, u16, 4> = Channel::new();
 pub static HAAS_STATE_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
 pub static MASTER_DRIVE_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
+pub static BITCRUSH_CHANNEL: Channel<CriticalSectionRawMutex, i8, 2> = Channel::new();
 pub static REVERSE_STATE_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
 pub static SAMPLE_PITCH_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
 pub static IS_RECORDING: AtomicBool = AtomicBool::new(false);
@@ -243,6 +245,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
 
     // --- 3. 音色状态 (已回退) ---
     let mut master_drive: f32 = 1.0;
+    let mut bitcrush: i8 = 0;
     let mut current_params = FmParams {
         index: 0.0,
         ratio: 2.0,
@@ -254,7 +257,6 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
     };
     let mut is_haas_active = false;
     let mut is_shift_held = false;
-    
 
     // --- 4. 包络 (已修改) ---
     let mut fm_envelope = Envelope::new(); // (已恢复)
@@ -279,6 +281,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
     let mut step_duration = Duration::from_millis(125);
     let mut last_tick_time = Instant::now();
     let mut sequence: [Option<StepData>; 32] = [None; 32];
+    let mut stutter_locked_data: Option<StepData> = None;
 
     // --- 7. 功能键 ID (不变) ---
     const CARRIER_WAVE_ID: u8 = 0;
@@ -291,7 +294,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
     const S_PARAM_ID: u8 = 6; // (Key 6)
     const R_PARAM_ID: u8 = 7; // (Key 7)
     const MASTER_DRIVE_ID: u8 = 8;
-    const REVERSE_TOGGLE_ID: u8 = 8;
+    const BITCRUSER_ID: u8 = 9;
 
     const ENV_TOGGLE_ID: u8 = 2; // (Key 2)
 
@@ -299,6 +302,8 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
     const SNARE_DRUM_ID: u8 = 1;
     const HAT_DRUM_ID: u8 = 2;
     const USER_ID: u8 = 3;
+    const REVERSE_TOGGLE_ID: u8 = 8;
+    const BEAT_REPEAT_TRIGGER_ID: u8 = 9;
 
     const DSP_MODE_ID: u8 = 12;
     const DRUM_MODE_ID: u8 = 13;
@@ -316,6 +321,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
     // -----------------------------------------------------------------
     let mut ticker = Ticker::every(Duration::from_millis(20));
     let mut skip_sequencer_step: Option<usize> = None;
+
     loop {
         // --- 8A. 检查所有通道 (已修改) ---
         if let Ok(rotation) = crate::synth::ENCODER_ROTARY_CHANNEL.try_receive() {
@@ -360,6 +366,10 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
                             master_drive =
                                 (master_drive + rotation as f32 * scale).clamp(1.0, 11.0);
                             let _ = MASTER_DRIVE_CHANNEL.try_send(master_drive);
+                        }
+                        EnvParam::Bitcrusher => {
+                            bitcrush = (bitcrush + rotation).clamp(0, 15);
+                            let _ = BITCRUSH_CHANNEL.try_send(bitcrush);
                         }
                     }
                 }
@@ -428,6 +438,17 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
                 }
             }
             row.set_high();
+        }
+
+        let is_stutter_pressed = current_key_state[BEAT_REPEAT_TRIGGER_ID as usize];
+        if is_stutter_pressed {
+            if stutter_locked_data.is_none() {
+                // 刚按下：锁定当前步的数据！
+                stutter_locked_data = sequence[current_step];
+            }
+        } else {
+            // 松开：解除锁定
+            stutter_locked_data = None;
         }
 
         for i in 0..16 {
@@ -648,6 +669,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
                                 S_PARAM_ID => active_env_param = EnvParam::Sustain, // Key 6
                                 R_PARAM_ID => active_env_param = EnvParam::Release, // Key 7
                                 MASTER_DRIVE_ID => active_env_param = EnvParam::MasterDrive,
+                                BITCRUSER_ID => active_env_param = EnvParam::Bitcrusher,
 
                                 _ => {}
                             },
@@ -673,7 +695,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
         last_key_state = current_key_state;
 
         let now = Instant::now();
-        if (sequencer_mode != SequencerMode::Stop)
+ if (sequencer_mode != SequencerMode::Stop)
             && (now.duration_since(last_tick_time) >= step_duration)
         {
             last_tick_time = now;
@@ -681,28 +703,45 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
             if current_step & 3 == 0 {
                 led.toggle();
             }
+            
+            // 1. 检查是否是刚刚手动录入的步进 (防双击)
             let is_skipped_step = skip_sequencer_step == Some(current_step);
             if is_skipped_step {
                 skip_sequencer_step = None; // 重置标记
             }
+            
             if !is_skipped_step {
-                if let Some(step_data) = sequence[current_step] {
-                    // 2. 检查是否有音符
+                // --- (新!) 核心逻辑：数据劫持 ---
+                // 优先使用 Stutter 锁定的数据；如果没有，才使用当前步进的数据
+                let active_step_data = if stutter_locked_data.is_some() {
+                    stutter_locked_data // 劫持！使用锁定的数据 (Beat Repeat)
+                } else {
+                    sequence[current_step] // 正常播放
+                };
+
+                // 统一处理播放逻辑 (无论是正常的还是劫持的)
+                if let Some(step_data) = active_step_data {
+                    
+                    // A. 播放音符 (FM Synth)
                     if let Some(note) = step_data.note {
-                        let base_frequency = NOTE_FREQUENCIES[note.key_code as usize]; //
+                        let base_frequency = NOTE_FREQUENCIES[note.key_code as usize]; 
                         let final_freq =
                             calculate_final_frequency(base_frequency, note.semitone, note.octave);
 
-                        fm_envelope.note_on(); //
-                        amp_envelope.note_on(); //
-                        let _ = AUDIO_CHANNEL.try_send(AudioCommand::Play(final_freq)); //
+                        // 在 Stutter 模式下，我们也需要重新触发包络
+                        fm_envelope.note_off(); // 确保瞬态
+                        fm_envelope.note_on(); 
+                        amp_envelope.note_off(); 
+                        amp_envelope.note_on(); 
+                        
+                        let _ = AUDIO_CHANNEL.try_send(AudioCommand::Play(final_freq)); 
                     } else if note_keys_pressed == 0 {
                         // (这一步有鼓，但没有音符)
-                        amp_envelope.note_off(); //
-                        fm_envelope.note_off(); //
+                        amp_envelope.note_off(); 
+                        fm_envelope.note_off(); 
                     }
 
-                    // --- 检查是否有鼓 ---
+                    // B. 播放鼓组 (Drums & Samples)
                     if step_data.drums.kick {
                         let _ = DRUM_CHANNEL.try_send(DrumSample::Kick);
                     }
@@ -713,12 +752,17 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
                         let _ = DRUM_CHANNEL.try_send(DrumSample::Hat);
                     }
                     if step_data.drums.sample {
-                        let _ = DRUM_CHANNEL.try_send(DrumSample::User);
+                        // 播放采样前检查长度
+                        let sample_len = crate::USER_SAMPLE_READY.load(Ordering::SeqCst);
+                        if sample_len > 0 {
+                            let _ = DRUM_CHANNEL.try_send(DrumSample::User); 
+                        }
                     }
+                    
                 } else if note_keys_pressed == 0 {
                     // (这一步是 None，完全是空的)
-                    amp_envelope.note_off(); //
-                    fm_envelope.note_off(); //
+                    amp_envelope.note_off(); 
+                    fm_envelope.note_off(); 
                 }
             }
         }
@@ -900,8 +944,47 @@ pub async fn record_task(
                         Timer::after_micros(80).await;
                     }
 
+                    let mut peak_amp: i32 = 0;
+                    for i in 0..current_pos {
+                        let sample = sample_buffer[i] as i32;
+                        // 使用 i32 取绝对值防止 -32768 溢出
+                        let abs_sample = sample.abs(); 
+                        if abs_sample > peak_amp {
+                            peak_amp = abs_sample;
+                        }
+                        
+                        // 关键：每处理 2000 个点让出一次 CPU，防止音频卡顿
+                        // 2000 个简单的整数比较非常快，不会导致 Overrun
+                        if i % 2000 == 0 {
+                            Timer::after_micros(1).await; 
+                        }
+                    }
+
+                    // 2. 应用增益 (Apply Gain)
+                    // 目标峰值：32000 (留一点余量，不要顶到 32767 的极限)
+                    // 只有当信号太小或有效时才处理
+                    if peak_amp > 100 && peak_amp < 32000 {
+                        let scale_factor = 32000.0 / peak_amp as f32;
+                        info!("Peak: {}, Scaling by: {}", peak_amp, scale_factor);
+
+                        for i in 0..current_pos {
+                            let raw = sample_buffer[i] as f32;
+                            let scaled = raw * scale_factor;
+                            sample_buffer[i] = scaled as i16;
+
+                            // 这里涉及浮点乘法，比较耗时，所以我们更频繁地让出 CPU
+                            // 每 1000 个点休息一次
+                            if i % 1000 == 0 {
+                                Timer::after_micros(1).await;
+                            }
+                        }
+                    } else {
+                        info!("Skipping normalization (Peak: {})", peak_amp);
+                    }
+                    // ---------------------------------------
+
                     // 录音结束，更新长度
-                    sample_ready_len.store(current_pos, Ordering::SeqCst);
+                    sample_ready_len.store(current_pos, Ordering::SeqCst); //
                     info!("Recording finished. Samples: {}", current_pos);
                 }
             }

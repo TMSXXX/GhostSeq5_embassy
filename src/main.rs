@@ -6,8 +6,7 @@ mod synth;
 mod wavetable;
 use crate::dsp::cheap_saturator;
 use crate::synth::{
-    DRUM_CHANNEL, DrumSample, FM_PARAM_CHANNEL, FmParams, MASTER_DRIVE_CHANNEL,
-    REVERSE_STATE_CHANNEL, SAMPLE_PITCH_CHANNEL,
+    BITCRUSH_CHANNEL, DRUM_CHANNEL, DrumSample, FM_PARAM_CHANNEL, FmParams, MASTER_DRIVE_CHANNEL, REVERSE_STATE_CHANNEL, SAMPLE_PITCH_CHANNEL
 };
 use crate::wavetable::{
     HAT_SAMPLE_LEN, KICK_SAMPLE_LEN, SNARE_SAMPLE_LEN, WAVE_TABLE_SIZE, WaveParams, Waveform,
@@ -266,6 +265,7 @@ async fn audio_task(
     let mut snare_pos: Option<usize> = None;
     let mut hat_pos: Option<usize> = None;
     let mut sample_slot_pos: Option<f32> = None;
+    let mut bitcrush: i8 = 0;
 
     // --- 2. 缓冲区, Haas, 常量, 波表 (不变) ---
     let audio_buffers = AUDIO_BUFFERS.init([[0u16; HALF_DMA_LEN]; 2]);
@@ -308,7 +308,8 @@ async fn audio_task(
                            haas_on: bool,
                            master_drive_val: f32,
                            is_reverse_val: bool,
-                           playback_step_val: f32| {
+                           playback_step_val: f32,
+                           bitcrush_val: i8| {
         // A. 预计算 (Pre-calculation) - 只执行一次
         let carrier_freq = freq;
         let modulator_freq = carrier_freq * p.ratio;
@@ -433,7 +434,9 @@ async fn audio_task(
             let final_sample_f32 = saturated_signal * final_scale_factor;
 
             // 优化 3: 使用常量 I16_SCALE (保留)
-            let mono_sample_i16 = (final_sample_f32 * I16_SCALE) as i16;
+            let mut mono_sample_i16 = (final_sample_f32 * I16_SCALE) as i16;
+
+            if bitcrush_val != 0 {mono_sample_i16 = (mono_sample_i16 >> bitcrush_val) << bitcrush_val;}
 
             // Haas 效果 (不变)
             let read_ptr = local_hwp;
@@ -496,6 +499,7 @@ async fn audio_task(
         master_drive,
         is_reverse,
         playback_step,
+        bitcrush,
     );
     fill_buffer(
         &mut audio_buffers[1],
@@ -516,6 +520,7 @@ async fn audio_task(
         master_drive,
         is_reverse,
         playback_step,
+        bitcrush,
     );
 
     i2s.start();
@@ -579,6 +584,9 @@ async fn audio_task(
         if let Ok(speed) = SAMPLE_PITCH_CHANNEL.try_receive() {
             playback_step = speed;
         }
+        if let Ok(bit) = BITCRUSH_CHANNEL.try_receive() {
+            bitcrush = bit;
+        }
 
         while let Ok(drum) = synth::DRUM_CHANNEL.try_receive() {
             match drum {
@@ -619,6 +627,7 @@ async fn audio_task(
             master_drive,
             is_reverse,
             playback_step,
+        bitcrush,
         );
     }
 }
