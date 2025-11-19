@@ -6,7 +6,8 @@ mod synth;
 mod wavetable;
 use crate::dsp::cheap_saturator;
 use crate::synth::{
-    BITCRUSH_CHANNEL, DRUM_CHANNEL, DrumSample, FM_PARAM_CHANNEL, FmParams, MASTER_DRIVE_CHANNEL, REVERSE_STATE_CHANNEL, SAMPLE_PITCH_CHANNEL
+    BITCRUSH_CHANNEL, DRUM_CHANNEL, DrumSample, FM_PARAM_CHANNEL, FmParams, MASTER_DRIVE_CHANNEL,
+    REVERSE_STATE_CHANNEL, SAMPLE_PITCH_CHANNEL, TAPE_FACTOR_CHANNEL,
 };
 use crate::wavetable::{
     HAT_SAMPLE_LEN, KICK_SAMPLE_LEN, SNARE_SAMPLE_LEN, WAVE_TABLE_SIZE, WaveParams, Waveform,
@@ -261,11 +262,12 @@ async fn audio_task(
         ratio: 2.0,
     };
     let mut is_reverse = false;
-    let mut kick_pos: Option<usize> = None;
-    let mut snare_pos: Option<usize> = None;
-    let mut hat_pos: Option<usize> = None;
+    let mut kick_pos: Option<f32> = None;
+    let mut snare_pos: Option<f32> = None;
+    let mut hat_pos: Option<f32> = None;
     let mut sample_slot_pos: Option<f32> = None;
     let mut bitcrush: i8 = 0;
+    let mut tape_factor: f32 = 1.0;
 
     // --- 2. 缓冲区, Haas, 常量, 波表 (不变) ---
     let audio_buffers = AUDIO_BUFFERS.init([[0u16; HALF_DMA_LEN]; 2]);
@@ -298,9 +300,9 @@ async fn audio_task(
                            amp: f32, // 这是 FM 的 amp
                            cp: &mut f32,
                            mp: &mut f32,
-                           kick_pos: &mut Option<usize>,
-                           snare_pos: &mut Option<usize>,
-                           hat_pos: &mut Option<usize>,
+                           kick_pos: &mut Option<f32>,
+                           snare_pos: &mut Option<f32>,
+                           hat_pos: &mut Option<f32>,
                            sample_slot_pos: &mut Option<f32>,
                            on: bool,
                            hdl: &mut [i16; HAAS_DELAY_SIZE],
@@ -309,13 +311,15 @@ async fn audio_task(
                            master_drive_val: f32,
                            is_reverse_val: bool,
                            playback_step_val: f32,
-                           bitcrush_val: i8| {
+                           bitcrush_val: i8,
+                           tape_factor_val: f32| {
         // A. 预计算 (Pre-calculation) - 只执行一次
+
+        let effective_freq = freq * tape_factor_val;
         let carrier_freq = freq;
         let modulator_freq = carrier_freq * p.ratio;
         let carrier_phase_increment = (TWO_PI * carrier_freq) / 48000.0;
         let modulator_phase_increment = (TWO_PI * modulator_freq) / 48000.0;
-
         // 分支提升: 将 match 移到循环外部 (保留!)
         let carrier_lut = match wp.carrier_wave {
             Waveform::Sine => sine_table,
@@ -345,12 +349,13 @@ async fn audio_task(
         let mut local_snare_pos = *snare_pos;
         let mut local_hat_pos = *hat_pos;
         let mut local_hwp = *hwp;
+        let effective_playback_step = playback_step_val * tape_factor_val;
+        let effective_drum_step = 1.0 * tape_factor_val;
 
         // B. 热循环 (Hot Loop)
         for i in 0..SAMPLES_PER_BUFFER {
             let mut drum_sample_f32 = 0.0;
             let fm_sample_f32 = if on {
-                // ... (相位计算不变) ...
                 let mod_phase_rads = *mp;
                 let mod_index_f32 = (mod_phase_rads * TWO_PI_INV) * TABLE_SIZE_F32;
                 let mod_idx0 = (mod_index_f32 as i32) as usize & TABLE_MASK;
@@ -377,25 +382,34 @@ async fn audio_task(
             // --- 鼓采样 (恢复安全查找) ---
 
             if let Some(pos) = local_kick_pos {
-                if pos < KICK_SAMPLE_LEN {
-                    drum_sample_f32 += kick_samples[pos]; // <--- 关键修改
-                    local_kick_pos = Some(pos + 1);
+                // local_kick_pos 也要改成 f32
+                let idx = pos as usize; // 取整用于读取
+                if idx < KICK_SAMPLE_LEN {
+                    drum_sample_f32 += kick_samples[idx];
+                    // 关键：步进受 tape_factor 控制
+                    local_kick_pos = Some(pos + effective_drum_step);
                 } else {
                     local_kick_pos = None;
                 }
             }
             if let Some(pos) = local_snare_pos {
-                if pos < SNARE_SAMPLE_LEN {
-                    drum_sample_f32 += snare_samples[pos]; // <--- 关键修改
-                    local_snare_pos = Some(pos + 1);
+                // local_kick_pos 也要改成 f32
+                let idx = pos as usize; // 取整用于读取
+                if idx < SNARE_SAMPLE_LEN {
+                    drum_sample_f32 += snare_samples[idx];
+                    // 关键：步进受 tape_factor 控制
+                    local_snare_pos = Some(pos + effective_drum_step);
                 } else {
                     local_snare_pos = None;
                 }
             }
             if let Some(pos) = local_hat_pos {
-                if pos < HAT_SAMPLE_LEN {
-                    drum_sample_f32 += hat_samples[pos]; // <--- 关键修改
-                    local_hat_pos = Some(pos + 1);
+                // local_hat_pos 也要改成 f32
+                let idx = pos as usize; // 取整用于读取
+                if idx < HAT_SAMPLE_LEN {
+                    drum_sample_f32 += hat_samples[idx];
+                    // 关键：步进受 tape_factor 控制
+                    local_hat_pos = Some(pos + effective_drum_step);
                 } else {
                     local_hat_pos = None;
                 }
@@ -417,7 +431,7 @@ async fn audio_task(
                     // 读取
                     drum_sample_f32 += sample_buffer[idx] as f32 / 32768.0;
                     // 步进 (始终向前走)
-                    *sample_slot_pos = Some(pos + playback_step_val);
+                    *sample_slot_pos = Some(pos + effective_playback_step);
                 } else {
                     *sample_slot_pos = None;
                 }
@@ -436,7 +450,9 @@ async fn audio_task(
             // 优化 3: 使用常量 I16_SCALE (保留)
             let mut mono_sample_i16 = (final_sample_f32 * I16_SCALE) as i16;
 
-            if bitcrush_val != 0 {mono_sample_i16 = (mono_sample_i16 >> bitcrush_val) << bitcrush_val;}
+            if bitcrush_val != 0 {
+                mono_sample_i16 = (mono_sample_i16 >> bitcrush_val) << bitcrush_val;
+            }
 
             // Haas 效果 (不变)
             let read_ptr = local_hwp;
@@ -500,6 +516,7 @@ async fn audio_task(
         is_reverse,
         playback_step,
         bitcrush,
+        tape_factor,
     );
     fill_buffer(
         &mut audio_buffers[1],
@@ -521,6 +538,7 @@ async fn audio_task(
         is_reverse,
         playback_step,
         bitcrush,
+        tape_factor,
     );
 
     i2s.start();
@@ -587,12 +605,15 @@ async fn audio_task(
         if let Ok(bit) = BITCRUSH_CHANNEL.try_receive() {
             bitcrush = bit;
         }
+        if let Ok(tf) = TAPE_FACTOR_CHANNEL.try_receive() {
+            tape_factor = tf;
+        }
 
         while let Ok(drum) = synth::DRUM_CHANNEL.try_receive() {
             match drum {
-                DrumSample::Kick => kick_pos = Some(0),
-                DrumSample::Snare => snare_pos = Some(0),
-                DrumSample::Hat => hat_pos = Some(0),
+                DrumSample::Kick => kick_pos = Some(0.),
+                DrumSample::Snare => snare_pos = Some(0.),
+                DrumSample::Hat => hat_pos = Some(0.),
                 DrumSample::User => sample_slot_pos = Some(0.),
             }
         }
@@ -627,7 +648,8 @@ async fn audio_task(
             master_drive,
             is_reverse,
             playback_step,
-        bitcrush,
+            bitcrush,
+            tape_factor,
         );
     }
 }

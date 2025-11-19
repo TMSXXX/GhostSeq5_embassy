@@ -1,5 +1,3 @@
-// (synth.rs)
-
 use core::f32::consts::PI;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -86,6 +84,7 @@ pub static MASTER_DRIVE_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Chan
 pub static BITCRUSH_CHANNEL: Channel<CriticalSectionRawMutex, i8, 2> = Channel::new();
 pub static REVERSE_STATE_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
 pub static SAMPLE_PITCH_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
+pub static TAPE_FACTOR_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
 pub static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -242,6 +241,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
     let mut note_keys_pressed: u8 = 0;
     let mut is_reverse = false;
     let mut sample_playback_speed: f32 = 0.18;
+    let mut tape_factor: f32 = 1.0;
 
     // --- 3. 音色状态 (已回退) ---
     let mut master_drive: f32 = 1.0;
@@ -295,6 +295,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
     const R_PARAM_ID: u8 = 7; // (Key 7)
     const MASTER_DRIVE_ID: u8 = 8;
     const BITCRUSER_ID: u8 = 9;
+    const TAPE_STOP_ID: u8 = 10;
 
     const ENV_TOGGLE_ID: u8 = 2; // (Key 2)
 
@@ -450,6 +451,19 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
             // 松开：解除锁定
             stutter_locked_data = None;
         }
+
+        let is_tape_stopping = (current_key_state[TAPE_STOP_ID as usize] && control_mode == ControlState::Drums);
+
+        if is_tape_stopping {
+            // 减速 (模拟摩擦力): 每次乘 0.92，制造指数级减速曲线
+            tape_factor = tape_factor * 0.92;
+            if tape_factor < 0.01 { tape_factor = 0.0; }
+        } else {
+            // 加速 (模拟电机启动): 线性回升
+            tape_factor = tape_factor + 0.05;
+            if tape_factor > 1.0 { tape_factor = 1.0; }
+        }
+        let _ = TAPE_FACTOR_CHANNEL.try_send(tape_factor);
 
         for i in 0..16 {
             let key_pressed = current_key_state[i] && !last_key_state[i];
@@ -695,7 +709,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
         last_key_state = current_key_state;
 
         let now = Instant::now();
- if (sequencer_mode != SequencerMode::Stop)
+        if (sequencer_mode != SequencerMode::Stop)
             && (now.duration_since(last_tick_time) >= step_duration)
         {
             last_tick_time = now;
@@ -703,13 +717,13 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
             if current_step & 3 == 0 {
                 led.toggle();
             }
-            
+
             // 1. 检查是否是刚刚手动录入的步进 (防双击)
             let is_skipped_step = skip_sequencer_step == Some(current_step);
             if is_skipped_step {
                 skip_sequencer_step = None; // 重置标记
             }
-            
+
             if !is_skipped_step {
                 // --- (新!) 核心逻辑：数据劫持 ---
                 // 优先使用 Stutter 锁定的数据；如果没有，才使用当前步进的数据
@@ -721,24 +735,23 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
 
                 // 统一处理播放逻辑 (无论是正常的还是劫持的)
                 if let Some(step_data) = active_step_data {
-                    
                     // A. 播放音符 (FM Synth)
                     if let Some(note) = step_data.note {
-                        let base_frequency = NOTE_FREQUENCIES[note.key_code as usize]; 
+                        let base_frequency = NOTE_FREQUENCIES[note.key_code as usize];
                         let final_freq =
                             calculate_final_frequency(base_frequency, note.semitone, note.octave);
 
                         // 在 Stutter 模式下，我们也需要重新触发包络
                         fm_envelope.note_off(); // 确保瞬态
-                        fm_envelope.note_on(); 
-                        amp_envelope.note_off(); 
-                        amp_envelope.note_on(); 
-                        
-                        let _ = AUDIO_CHANNEL.try_send(AudioCommand::Play(final_freq)); 
+                        fm_envelope.note_on();
+                        amp_envelope.note_off();
+                        amp_envelope.note_on();
+
+                        let _ = AUDIO_CHANNEL.try_send(AudioCommand::Play(final_freq));
                     } else if note_keys_pressed == 0 {
                         // (这一步有鼓，但没有音符)
-                        amp_envelope.note_off(); 
-                        fm_envelope.note_off(); 
+                        amp_envelope.note_off();
+                        fm_envelope.note_off();
                     }
 
                     // B. 播放鼓组 (Drums & Samples)
@@ -755,15 +768,16 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
                         // 播放采样前检查长度
                         let sample_len = crate::USER_SAMPLE_READY.load(Ordering::SeqCst);
                         if sample_len > 0 {
-                            let _ = DRUM_CHANNEL.try_send(DrumSample::User); 
+                            let _ = DRUM_CHANNEL.try_send(DrumSample::User);
                         }
                     }
-                    
                 } else if note_keys_pressed == 0 {
                     // (这一步是 None，完全是空的)
-                    amp_envelope.note_off(); 
-                    fm_envelope.note_off(); 
+                    amp_envelope.note_off();
+                    fm_envelope.note_off();
                 }
+
+                
             }
         }
         // --- 8E. 运行包络 & 发送参数 (已修改) ---
@@ -948,15 +962,15 @@ pub async fn record_task(
                     for i in 0..current_pos {
                         let sample = sample_buffer[i] as i32;
                         // 使用 i32 取绝对值防止 -32768 溢出
-                        let abs_sample = sample.abs(); 
+                        let abs_sample = sample.abs();
                         if abs_sample > peak_amp {
                             peak_amp = abs_sample;
                         }
-                        
+
                         // 关键：每处理 2000 个点让出一次 CPU，防止音频卡顿
                         // 2000 个简单的整数比较非常快，不会导致 Overrun
                         if i % 2000 == 0 {
-                            Timer::after_micros(1).await; 
+                            Timer::after_micros(1).await;
                         }
                     }
 
