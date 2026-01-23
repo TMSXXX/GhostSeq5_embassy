@@ -50,6 +50,7 @@ pub enum EnvParam {
     Release,
     MasterDrive,
     Bitcrusher,
+    FmIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -85,6 +86,7 @@ pub static BITCRUSH_CHANNEL: Channel<CriticalSectionRawMutex, i8, 2> = Channel::
 pub static REVERSE_STATE_CHANNEL: Channel<CriticalSectionRawMutex, bool, 2> = Channel::new();
 pub static SAMPLE_PITCH_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
 pub static TAPE_FACTOR_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
+pub static MASTER_VOLUME_CHANNEL: Channel<CriticalSectionRawMutex, f32, 2> = Channel::new();
 pub static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -286,7 +288,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
     // --- 7. 功能键 ID (不变) ---
     const CARRIER_WAVE_ID: u8 = 0;
     const MOD_WAVE_ID: u8 = 1;
-    const HAAS_TOGGLE_ID: u8 = 3; // (改为 Key 3)
+    const HAAS_TOGGLE_ID: u8 = 10; // (改为 Key 3)
     const RECORD_START_ID: u8 = 11; // Key 11: 启动/停止录音
 
     const A_PARAM_ID: u8 = 4; // (Key 4)
@@ -296,6 +298,7 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
     const MASTER_DRIVE_ID: u8 = 8;
     const BITCRUSER_ID: u8 = 9;
     const TAPE_STOP_ID: u8 = 10;
+    const FM_INDEX_SELECT_ID: u8 = 3;
 
     const ENV_TOGGLE_ID: u8 = 2; // (Key 2)
 
@@ -372,6 +375,13 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
                             bitcrush = (bitcrush + rotation).clamp(0, 15);
                             let _ = BITCRUSH_CHANNEL.try_send(bitcrush);
                         }
+                        EnvParam::FmIndex => {
+                             // 范围 0.0 ~ 10.0
+                             max_fm_index = (max_fm_index + rotation as f32 * scale * 0.5).clamp(0.0, 10.0);
+                             // 注意：这里不需要发 Channel，因为 FM Index 是每一帧 tick() 动态计算发出的
+                             // (可选) 发送 UI 显示 (归一化到 0-1)
+                             //let _ = crate::UI_CHANNEL.try_send(crate::UiEvent::Parameter(max_fm_index / 10.0));
+                        }
                     }
                 }
 
@@ -425,8 +435,15 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
         }
 
         if let Ok(val) = crate::synth::POT1_CHANNEL.try_receive() {
-            // (不变) 电位器 始终 控制 FM Index
-            max_fm_index = (val as f32 / 4095.0) * 10.0;
+            // ADC 值是 0 ~ 4095
+            // 映射到 0.0 ~ 1.2 (允许稍微有一点增益提升，或者设为 1.0)
+            let vol = (val as f32 / 4095.0) * 1.2;
+            
+            // 发送给音频任务
+            let _ = MASTER_VOLUME_CHANNEL.try_send(vol);
+            
+            // (可选) 如果屏幕做好了，也可以发给 UI 显示音量条
+            // let _ = UI_CHANNEL.try_send(UiEvent::Parameter(vol / 1.2));
         }
 
         // --- 8B. 扫描键盘 (不变) ---
@@ -674,16 +691,17 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
                                     };
                                 }
                                 HAAS_TOGGLE_ID => {
-                                    // Key 3: Haas Toggle
+                                    // Key 10
                                     is_haas_active = !is_haas_active;
                                     let _ = HAAS_STATE_CHANNEL.try_send(is_haas_active);
                                 }
+                                FM_INDEX_SELECT_ID => active_env_param = EnvParam::FmIndex, // Key 3
                                 A_PARAM_ID => active_env_param = EnvParam::Attack, // Key 4
                                 D_PARAM_ID => active_env_param = EnvParam::Decay,  // Key 5
                                 S_PARAM_ID => active_env_param = EnvParam::Sustain, // Key 6
                                 R_PARAM_ID => active_env_param = EnvParam::Release, // Key 7
-                                MASTER_DRIVE_ID => active_env_param = EnvParam::MasterDrive,
-                                BITCRUSER_ID => active_env_param = EnvParam::Bitcrusher,
+                                MASTER_DRIVE_ID => active_env_param = EnvParam::MasterDrive, // Key 8
+                                BITCRUSER_ID => active_env_param = EnvParam::Bitcrusher, // Key 9
 
                                 _ => {}
                             },
@@ -811,7 +829,6 @@ pub async fn control_task(keys: [[Peri<'static, AnyPin>; 4]; 2], mut led: Output
 //     }
 // }
 
-// (encoder_task 已修复)
 #[task]
 pub async fn encoder_task(
     mut clk_a: ExtiInput<'static>,
@@ -820,7 +837,7 @@ pub async fn encoder_task(
 ) {
     info!("Encoder task (P7) started!");
 
-    // 开关去抖参数（保持不变）
+    // 开关去抖参数
     let mut sw_stable_state = true;
     let mut sw_last_reading = true;
     let mut sw_stable_counter = 0;
@@ -832,57 +849,46 @@ pub async fn encoder_task(
     let dt_init = dt_b.is_high() as u8;
     last_state = (dt_init << 1) | clk_init; // DT (bit 1) | CLK (bit 0)
 
-    // --- (新!) 旋转锁定状态 ---
     // 0: 等待变化; 1, 2, 3: 步进中; 4: 锁定/完成
     let mut rotation_lock_counter: u8 = 0;
 
-    // (删除 Rotary Cooldown，因为我们使用状态锁定代替)
 
     loop {
-        // 等待CLK或DT的任何边沿触发
         let clk_edge = clk_a.wait_for_any_edge();
         let dt_edge = dt_b.wait_for_any_edge();
         let sw_edge = sw.wait_for_any_edge();
         let tick = Timer::after_millis(5);
 
         match select(select(clk_edge, dt_edge), select(sw_edge, tick)).await {
-            // --- 处理CLK或DT边沿变化（核心修改：增加状态锁定）---
+            // 旋转处理
             Either::First(_) => {
-                // 1. 读取当前CLK和DT电平
                 let clk_curr = clk_a.is_high() as u8;
                 let dt_curr = dt_b.is_high() as u8;
                 let curr_state = (dt_curr << 1) | clk_curr;
 
-                // 2. 判断方向 (使用状态序列对比)
+                // 判断方向
                 let direction = match (last_state, curr_state) {
-                    (0b00, 0b01) | (0b01, 0b11) | (0b11, 0b10) | (0b10, 0b00) => -1, // 逆时针
-                    (0b00, 0b10) | (0b10, 0b11) | (0b11, 0b01) | (0b01, 0b00) => 1,  // 顺时针
+                    (0b00, 0b01) | (0b01, 0b11) | (0b11, 0b10) | (0b10, 0b00) => 1, // 逆时针
+                    (0b00, 0b10) | (0b10, 0b11) | (0b11, 0b01) | (0b01, 0b00) => -1,  // 顺时针
                     _ => 0, // 无效状态（抖动或快速变化）
                 };
 
-                // 3. 核心锁定逻辑
-                if direction != 0 {
-                    // 如果是有效步进，增加计数器
+                if direction != 0 {  
                     rotation_lock_counter += 1;
-
-                    // 只有当计数器达到 4 (完成一个完整四步) 时，才发送输出并重置
+ 
                     if rotation_lock_counter == 4 {
                         let _ = ENCODER_ROTARY_CHANNEL.try_send(direction);
-                        rotation_lock_counter = 0; // 重置，等待下一个完整的 4 步
+                        rotation_lock_counter = 0;
                     }
                 } else if curr_state == last_state {
-                    // 如果状态不变（物理触点静止），不应该影响计数器
                 } else {
-                    // 如果是无效状态（抖动，例如 00 -> 11），我们不发送，也不增加计数器
                 }
 
-                // 4. 更新上一次状态
                 last_state = curr_state;
             }
 
-            // --- 开关处理（保持不变）---
+            // 开关处理
             Either::Second(either_sw_or_tick) => match either_sw_or_tick {
-                // ... (开关去抖逻辑保持不变) ...
                 Either::First(_) => {
                     sw_stable_counter = 0;
                 }
@@ -922,9 +928,7 @@ pub async fn record_task(
     let mut pot_ticker = Ticker::every(Duration::from_millis(20));
 
     loop {
-        // --- 1. 等待: "录音命令" 或 "电位器定时器" ---
         match select(RECORD_COMMAND_CHANNEL.receive(), pot_ticker.next()).await {
-            // --- 1A. 收到了录音命令 (START) ---
             Either::First(command) => {
                 if command == true {
                     info!("Recording started...");
@@ -947,38 +951,35 @@ pub async fn record_task(
 
                         let amplified = centered * 1;
 
-                        // 3. 软削波 (防止溢出 i16 范围)
+                        // 软削波
                         let final_sample = amplified.clamp(-32768, 32767) as i16;
 
-                        // 4. 写入缓冲区
+                        // 缓冲区
                         sample_buffer[current_pos] = final_sample;
 
                         current_pos += 1;
-                        // 保持采样率 (约 10kHz)
+                        // 保持采样率
                         Timer::after_micros(80).await;
                     }
 
                     let mut peak_amp: i32 = 0;
                     for i in 0..current_pos {
                         let sample = sample_buffer[i] as i32;
-                        // 使用 i32 取绝对值防止 -32768 溢出
+                        // 使用 i32 取绝对值
                         let abs_sample = sample.abs();
                         if abs_sample > peak_amp {
                             peak_amp = abs_sample;
                         }
 
-                        // 关键：每处理 2000 个点让出一次 CPU，防止音频卡顿
-                        // 2000 个简单的整数比较非常快，不会导致 Overrun
+                        // 防音频卡顿
                         if i % 2000 == 0 {
                             Timer::after_micros(1).await;
                         }
                     }
 
-                    // 2. 应用增益 (Apply Gain)
-                    // 目标峰值：32000 (留一点余量，不要顶到 32767 的极限)
-                    // 只有当信号太小或有效时才处理
-                    if peak_amp > 100 && peak_amp < 32000 {
-                        let scale_factor = 32000.0 / peak_amp as f32;
+                    // gain，目标峰值32000
+                    if peak_amp > 100 && peak_amp < 28000 {
+                        let scale_factor = 28000.0 / peak_amp as f32;
                         info!("Peak: {}, Scaling by: {}", peak_amp, scale_factor);
 
                         for i in 0..current_pos {
@@ -986,8 +987,6 @@ pub async fn record_task(
                             let scaled = raw * scale_factor;
                             sample_buffer[i] = scaled as i16;
 
-                            // 这里涉及浮点乘法，比较耗时，所以我们更频繁地让出 CPU
-                            // 每 1000 个点休息一次
                             if i % 1000 == 0 {
                                 Timer::after_micros(1).await;
                             }
@@ -995,19 +994,17 @@ pub async fn record_task(
                     } else {
                         info!("Skipping normalization (Peak: {})", peak_amp);
                     }
-                    // ---------------------------------------
-
                     // 录音结束，更新长度
                     sample_ready_len.store(current_pos, Ordering::SeqCst); //
                     info!("Recording finished. Samples: {}", current_pos);
                 }
             }
 
-            // --- 1B. 电位器定时器触发 (平时状态) ---
+            // 电位器
             Either::Second(_) => {
-                // 只有在不录音的时候，才读取电位器
+                // 不录音时读取电位器
                 let pot_value: u16 = adc.blocking_read(&mut pot_pin);
-                // 尝试发送，如果满了就丢弃，防止阻塞
+                // 尝试发送，防堵塞
                 let _ = POT1_CHANNEL.try_send(pot_value);
             }
         }
